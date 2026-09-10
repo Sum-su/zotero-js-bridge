@@ -1,0 +1,18 @@
+{
+  "addons": {
+    "zoterojs-bridge@local": {
+      "updates": [
+        {
+          "version": "1.0.4",
+          "update_link": "https://github.com/Sum-su/zotero-js-bridge/releases/download/v1.0.4/zotero-js-bridge.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "6.999",
+              "strict_max_version": "10.99.99"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

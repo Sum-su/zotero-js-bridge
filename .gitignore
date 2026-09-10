@@ -1,0 +1,25 @@
+# 构建产物
+*.xpi
+# 图标预览图（make_icon.py --preview 生成）
+addon/icons/_preview*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------- 千万别提交 ----------
+# token 文件是能直接读你整个 Zotero 库的凭据
+zoterojs-token.txt
+token.txt
+# Zotero 数据库副本，别把库带进仓库
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

@@ -1,0 +1,6 @@
+# 仓库里一律 LF，工作区也一样 —— 免得 Windows 上 checkout 出来是 CRLF，
+# 再提交回去整个文件都显示成改动。
+* text=auto eol=lf
+
+*.png binary
+*.xpi binary
