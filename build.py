@@ -57,6 +57,50 @@ def bump() -> str:
     return new
 
 
+def sync_updates(man):
+    """让 updates.json 跟上 manifest 的版本，返回 (旧版本, 新版本) 或 None。
+
+    "已装用户能不能收到更新"读的是 manifest 里 update_url 指向的这份文件，而插件市场
+    读的是 xpi 里的 manifest。忘了同步 updates.json，市场会显示新版本、老用户却永远停在
+    旧版本 —— 两边都"看起来正常"。所以版本只认 manifest 一处，这里现抄。
+    """
+    p = os.path.join(HERE, "updates.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    # owner/repo 从 update_url 里抠，省得仓库地址在两处各写一遍、改一处漏一处
+    url = man.get("applications", {}).get("zotero", {}).get("update_url", "")
+    m = re.search(r"raw\.githubusercontent\.com/([^/]+)/([^/]+)/", url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+
+    zapp = man["applications"]["zotero"]
+    ver = man["version"]
+    ups = data.setdefault("addons", {}).setdefault(zapp["id"], {}).setdefault("updates", [{}])
+    if len(ups) != 1:
+        sys.exit(f"updates.json 里 {zapp['id']} 有 {len(ups)} 条更新记录，"
+                 "本脚本只会维护一条，请先手动整理")
+
+    old = ups[0].get("version")
+    ups[0]["version"] = ver
+    ups[0]["update_link"] = (
+        f"https://github.com/{owner}/{repo}/releases/download/v{ver}/"
+        f"{os.path.basename(OUT)}")
+    ups[0]["applications"] = {"zotero": {
+        "strict_min_version": zapp["strict_min_version"],
+        "strict_max_version": zapp["strict_max_version"],
+    }}
+
+    # newline="\n" 同理：Windows 文本模式会写成 CRLF，把整个文件翻掉
+    with open(p, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return old, ver
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bump", action="store_true")
@@ -85,6 +129,10 @@ def main():
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
         for n in names:
             z.write(os.path.join(SRC, n.replace("/", os.sep)), n)
+
+    synced = sync_updates(man)
+    if synced and synced[0] != synced[1]:
+        print(f"updates.json 版本 {synced[0]} → {synced[1]}")
 
     print(f"{OUT}  {os.path.getsize(OUT)} bytes  v{man['version']}")
     for n in names:

@@ -33,6 +33,16 @@ jobs:
       - name: Build xpi
         run: python build.py
 
+      # build.py 会把 updates.json 刷成 manifest 的版本。刷完还有 diff，说明这文件被
+      # 手改过、两边对不上了 —— 那正是"市场显示新版、老用户收不到更新"的成因。
+      - name: updates.json 必须和 manifest 同步
+        run: |
+          if ! git diff --quiet -- updates.json; then
+            echo "::error::updates.json 与 manifest 版本不一致，跑一下 python build.py 并提交"
+            git diff -- updates.json
+            exit 1
+          fi
+
       - name: Upload xpi
         uses: actions/upload-artifact@v7
         with:

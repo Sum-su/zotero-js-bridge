@@ -12,6 +12,9 @@
     python zoterojs.py ping
     python zoterojs.py exec "return Zotero.Libraries.userLibraryID"
     python zoterojs.py merge MASTERKEY DUPKEY [DUPKEY ...] [--dry-run]
+    python zoterojs.py logs [--source console|debug|both] [--min-level warn]
+                            [--limit N] [--grep TEXT] [--category TEXT]
+                            [--since EPOCH_MS] [--clear]
 """
 
 from __future__ import annotations
@@ -196,6 +199,30 @@ def merge(master: str, dups, dry_run: bool = False) -> dict:
                                      "dryRun": dry_run})
 
 
+def logs(source: str = "console", min_level: str = "all", limit: int = 100,
+         grep: str = None, category: str = None, since: int = None,
+         clear: bool = False, timeout: int = 60) -> dict:
+    """读 Zotero 的错误控制台 / 调试输出。
+
+    source:    console（默认，永远有货）| debug | both
+    min_level: all | debug | info | warn | error —— "至少这么严重"
+    limit:     最多回多少条（从最新往回取），上限 1000
+    clear:     读完清空对应来源，**不可撤销**
+
+    注意 debug 缓冲默认是空的：它只在 extensions.zotero.debug.store 打开时记录，
+    而那个 pref 是一次性的，Zotero 启动读完就自己设回 false。
+    """
+    payload = {"source": source, "minLevel": min_level, "limit": limit,
+               "clear": clear}
+    if grep:
+        payload["grep"] = grep
+    if category:
+        payload["category"] = category
+    if since:
+        payload["since"] = since
+    return _post("/zoterojs/logs", payload, timeout=timeout)
+
+
 def _main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -220,6 +247,51 @@ def _main(argv):
             return 1
         res = merge(args[0], args[1:], dry_run="--dry-run" in argv)
         print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif cmd == "logs":
+        kw = {"source": "console", "min_level": "all", "limit": 100}
+        rest = argv[2:]
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a in ("--source", "--min-level", "--limit", "--grep",
+                     "--category", "--since"):
+                if i + 1 >= len(rest):
+                    print(f"{a} 后面要给个值", file=sys.stderr)
+                    return 1
+                key = {"--source": "source", "--min-level": "min_level",
+                       "--limit": "limit", "--grep": "grep",
+                       "--category": "category", "--since": "since"}[a]
+                kw[key] = rest[i + 1]
+                i += 2
+                continue
+            if a == "--clear":
+                kw["clear"] = True
+                i += 1
+                continue
+            print(f"未知参数: {a}", file=sys.stderr)
+            return 1
+        kw["limit"] = int(kw["limit"])
+        if "since" in kw:
+            kw["since"] = int(kw["since"])
+        res = logs(**kw)
+        if res.get("cleared"):
+            print(f"[已清空: {', '.join(res['cleared'])}]", file=sys.stderr)
+        for m in (res.get("console") or {}).get("messages", []):
+            # 有 logger 就显示 logger，没有才退回 category —— 两者互斥，Log 消息没有 category
+            tag = m.get("logger") or m.get("category") or "-"
+            print(f"{m.get('iso', '')}  {(m.get('level') or ''):9} "
+                  f"{tag:14} {m.get('message')}")
+        c = res.get("console")
+        if c:
+            tail = f"（共 {c['total']} 条，命中 {c['matched']}，显示 {c['returned']}"
+            tail += f"，省略 {c['omitted']}）" if c.get("omitted") else "）"
+            print(tail, file=sys.stderr)
+        d = res.get("debug")
+        if d:
+            if d.get("note"):
+                print(d["note"], file=sys.stderr)
+            elif d.get("text"):
+                print(d["text"])
     else:
         print(f"未知命令: {cmd}", file=sys.stderr)
         return 1

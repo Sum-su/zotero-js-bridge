@@ -8,7 +8,7 @@ storage backends, bulk-editing fields, calling internal modules — can only be
 done from inside the Zotero process. Normally that means opening
 **Tools → Developer → Run JavaScript** and pasting code by hand, every time.
 
-This plugin opens three local HTTP endpoints on the HTTP server Zotero already
+This plugin opens four local HTTP endpoints on the HTTP server Zotero already
 runs (`127.0.0.1:23119`), so a script can do it instead.
 
 ```console
@@ -69,8 +69,9 @@ response). Top-level `await` and `return` both work.
 | GET | `/zoterojs/ping` | none |
 | POST | `/zoterojs/exec` | `X-ZoteroJS-Token` |
 | POST | `/zoterojs/merge` | `X-ZoteroJS-Token` |
+| GET, POST | `/zoterojs/logs` | `X-ZoteroJS-Token` |
 
-All three ride on Zotero's own server — nothing new is bound, and no socket is
+All four ride on Zotero's own server — nothing new is bound, and no socket is
 held open, so Zotero still exits cleanly.
 
 Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin`
@@ -89,10 +90,65 @@ yet, and a naive comparison rejects them as false duplicates.
 same title / same item type / year / volume / issue / pages / DOI / ISBN
 ```
 
+Values are normalized before comparison: whitespace, `_.,;:()[]`, CJK
+punctuation, and **every dash variant** — ASCII `-`, en dash `–`, em dash `—`,
+minus sign `−`, non-breaking hyphen, zero-width space. This last part matters
+because Zotero's translators routinely deliver `1–10` (U+2013) where you'd
+typed `1-10`, and comparing them literally rejects a genuine duplicate.
+
 The ISBN check is the backstop for the classic disaster: two volumes of the
 same textbook with identical title and authors, differing only in ISBN and
 edition. `master` survives, duplicates go to the trash, and `Ctrl+Z`
 undoes it in Zotero.
+
+## The `logs` endpoint
+
+Reads Zotero's error console and/or its debug output, so a script can check
+what a plugin (including this one) actually did without you clicking through
+**Tools → Developer → Error Console**.
+
+```bash
+python zoterojs.py logs                         # newest 100 console messages
+python zoterojs.py logs --min-level warning     # errors + warnings only
+python zoterojs.py logs --grep "JS Bridge"      # anything mentioning the bridge
+python zoterojs.py logs --source debug          # Zotero's own debug log
+```
+
+Query parameters work the same over GET or POST (JSON body):
+
+| Param | Default | Meaning |
+| --- | --- | --- |
+| `source` | `console` | `console`, `debug`, or `both` |
+| `minLevel` | `all` | `all` / `debug` / `info` / `warn` / `error` — "at least this severe" |
+| `category` | — | substring match, case-insensitive |
+| `grep` | — | substring match on the text (and on `logger`, when present) |
+| `since` | — | epoch ms; only messages at or after this |
+| `limit` | `100` | max messages to return, newest kept first (cap 1000) |
+| `clear` | `false` | clear the sources you read — **destructive** |
+
+Each message comes back with `time`/`iso`, `level`, `message`, and — when the
+console entry has them — `category`, `source`, `line`, `column`. Messages that
+Firefox's `Log.sys.mjs` wrote carry a `<timestamp>\t<logger>\t<LEVEL>\t` prefix;
+that prefix is stripped (the logger name is returned separately as `logger`),
+and the level is taken from the text rather than from the entry's `logLevel`
+field, because the two disagree in practice: an `addons.xpi` entry whose body
+reads `WARN` reports `logLevel = 1`, which is *info*. Trusting `logLevel` would
+make `minLevel=warn` silently drop it — the exact entry that filter exists to
+find.
+
+**The two sources are not interchangeable.** `console` is always populated and
+needs no configuration. `debug` is empty by default and that is not a bug: the
+buffer only fills when `extensions.zotero.debug.store` is set, and that pref is
+**one-shot** — Zotero reads it at startup and immediately resets it to `false`.
+Set it, restart Zotero, and you get one session's worth of output. When the
+buffer is empty the endpoint says so and tells you this instead of returning
+nothing.
+
+`debug` output is read via `Zotero.Debug.get()`. `get(maxChars, maxLineLength)`
+is *not* used, because passing `maxLineLength` makes Zotero ellipsize lines
+**in place** inside its own buffer, permanently truncating output the user may
+still be reading; and `getConsoleViewerOutput()` drains the viewer's queue,
+which would silently steal lines from an open debug-output window.
 
 ## Gotcha: Zotero 10's data APIs are async
 
@@ -135,9 +191,13 @@ should accept knowingly:
   pretend to be.
 - **No TLS.** Traffic is loopback plaintext.
 
-Mitigations that are present: token required on `exec` and `merge`, constant
-comparison against the stored token, a 1.5 MB response cap, and endpoint
-cleanup on `shutdown()`.
+Mitigations that are present: token required on `exec`, `merge`, and `logs`;
+constant-time comparison against the stored token; a 1.5 MB response cap; and
+endpoint cleanup on `shutdown()`.
+
+> The constant-time comparison is real as of v1.0.6, but it was *claimed* from
+> v1.0.0 while the code did a plain `!==` the whole time. If you audited an
+> earlier version against this README, the README was wrong, not your audit.
 
 If that trade is wrong for you, don't install it — or set
 `extensions.zotero.jsbridge.enabled` to `false` to disable the endpoints while
@@ -178,7 +238,7 @@ branch.
 ## Development
 
 ```bash
-node test_bridge.js              # 33 tests against stubbed Zotero globals
+node test_bridge.js              # 56 tests against stubbed Zotero globals
 python make_icon.py --preview    # icon variants sheet, writes nothing
 python build.py                  # package the xpi
 python build.py --bump           # bump patch version first
@@ -202,10 +262,10 @@ Zotero 的插件 API 没有进程外通道。凡是连接器 API 覆盖不到的
 搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。常规做法是打开
 **工具 → 开发者 → Run JavaScript**，每次手动贴代码。
 
-这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了三个 HTTP
+这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了四个 HTTP
 端点，让脚本可以代劳。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
 
-> **安全提醒**：这三个端点能在 Zotero 里执行**任意 JS**，可读写你整个库。
+> **安全提醒**：这些端点能在 Zotero 里执行**任意 JS**，可读写你整个库。
 > 任何能读到 token 文件的进程都能删掉你的库。这是个人自动化工具，不是加固过的
 > 服务——装之前请先读英文部分的 [Security model](#security-model)。
 
@@ -217,6 +277,7 @@ Install Add-on From File…**。装入后 token 会自动写到 `<数据目录>/
 python zoterojs.py ping
 python zoterojs.py exec "return (await Zotero.Items.getAll(1, true)).length"
 python zoterojs.py merge 主条目KEY 重复KEY --dry-run
+python zoterojs.py logs --min-level warning
 ```
 
 **最容易踩的坑**：Zotero 10 里 `Zotero.Items.getAll` / `getDeleted` / `getAsync`
@@ -224,8 +285,16 @@ python zoterojs.py merge 主条目KEY 重复KEY --dry-run
 只会静默返回 `{}` 或 `undefined`——序列化器现在会把这种情况显式标出来。
 
 `merge` 的自检判据是「**两边都有值且不同**才算冲突」，缺失不算冲突，
-否则网络首发版（天生没有卷期页）会被误判成冲突而拒绝合并。ISBN 那条是硬防线：
+否则网络首发版（天生没有卷期页）会被误判成冲突而拒绝合并。比对前会归一化
+空白、各类标点和**全部破折号变体**（ASCII `-`、en dash `–`、em dash `—`、
+减号 `−`、非断连字符、零宽空格）——Zotero 抓回来的条目里 `1–10` 常是 U+2013，
+跟手打的 `1-10` 逐字符比就会把真重复误杀。ISBN 那条是硬防线：
 同一教材上下册标题作者全同，只有 ISBN 和版次不同，绝不能合并。
+
+`logs` 端点有两个来源，可用性不一样：`console` 是**工具 → 错误控制台**那些，
+永远有货、不用配置；`debug` 默认是空的，**这不是坏了**——它只在
+`extensions.zotero.debug.store` 打开时才记录，而且那个 pref 是**一次性**的，
+Zotero 启动读完就自己设回 `false`。设好重启，能拿到一个会话的输出。
 
 ## License
 
