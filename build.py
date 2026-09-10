@@ -51,7 +51,8 @@ def bump() -> str:
     if not m:
         sys.exit("manifest 里找不到 x.y.z 形式的 version")
     new = f"{m.group(1)}.{m.group(2)}.{int(m.group(3)) + 1}"
-    with open(p, "w", encoding="utf-8") as fh:
+    # newline="\n"：Windows 上文本模式会把 \n 写成 \r\n，每次 bump 都把整个文件翻成 CRLF
+    with open(p, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(raw[:m.start()] + f'"version": "{new}"' + raw[m.end():])
     return new
 
