@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "name": "Zotero JS Bridge",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Local-only endpoints for executing JavaScript inside Zotero. Rides on Zotero's own 127.0.0.1 server; every call needs X-ZoteroJS-Token.",
-  "author": "local",
+  "author": "Sum-su",
   "icons": {
     "48": "icons/favicon@0.5x.png",
     "96": "icons/favicon.png"

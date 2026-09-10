@@ -24,6 +24,14 @@ OUT = os.path.join(HERE, "zotero-js-bridge.xpi")
 # 打进包里的东西。icons/ 下只收 favicon*，别把预览图捎进去。
 FIXED = ["manifest.json", "bootstrap.js", "prefs.js"]
 
+# Windows 控制台默认 GBK，中文输出会变成乱码，和 zoterojs.py 一样强制 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        if (_s.encoding or "").lower().replace("-", "") != "utf8":
+            _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 
 def collect() -> list[str]:
     names = list(FIXED)
