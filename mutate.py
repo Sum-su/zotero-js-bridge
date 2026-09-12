@@ -104,7 +104,12 @@ def run(name, old, new, rel="addon/bootstrap.js"):
     if old not in orig:
         print(f"  ?  {name}: 找不到锚点，跳过（说明代码已经和这里写的不一样了）")
         return None
-    path.write_text(orig.replace(old, new, 1), encoding="utf-8")
+    # newline="\n" 不能省。Path.write_text() 默认走文本模式，Windows 上会把 \n
+    # 写成 \r\n：变异体写下去的那一刻行尾就翻了面，而 finally 里还原的是**内容**，
+    # 复原不了行尾。于是跑一轮 mutate.py 就可能把工作副本从 LF 翻成 CRLF ——
+    # .gitattributes 声明的却是 eol=lf，且 git status 看不出来（text=auto 会把
+    # CRLF 归一化掉再比较）。build.py 为同一件事早就加过这个参数，这两处漏了。
+    path.write_text(orig.replace(old, new, 1), encoding="utf-8", newline="\n")
     try:
         p = subprocess.run(["node", "test_bridge.js"], cwd=ROOT,
                            capture_output=True, text=True, encoding="utf-8")
@@ -121,7 +126,7 @@ def run(name, old, new, rel="addon/bootstrap.js"):
             print(f"       {summary.group(0)}")
         return True
     finally:
-        path.write_text(orig, encoding="utf-8")
+        path.write_text(orig, encoding="utf-8", newline="\n")
 
 
 def main():
