@@ -50,6 +50,13 @@ class Item {
     const { parentItemID, ...rest } = o;
     Object.assign(this, rest);
     if (this.itemID === undefined) this.itemID = itemSeq++;
+    /* 真机的 Item 上 `.id` 和 `.itemID` 是同一个值（item.js 里 `this.id = this.itemID`），
+       插件代码两种写法都有。stub 只给 itemID 的话，写成 `.id` 的那处会拿到 undefined
+       → getFullText(undefined) 抛错 → 被 catch 成 chars = null ——
+       **于是"抽不出来"和"没有文本层"在候选列表里长得一模一样**（都进候选，只差一个
+       error 字段）。而这一处恰恰就是"这个 PDF 有没有文本层"的判据，判错了整张候选表就翻。
+       （实测：把这一行和 bootstrap 里的 `.itemID` 一起改回去，4 条断言当场转红。） */
+    this.id = this.itemID;
     if (this.deleted === undefined) this.deleted = false;
     this._parentItemID = parentItemID === undefined ? null : parentItemID;
     if (this.itemTypeID === undefined) this.itemTypeID = TYPE_ID[this.itemType] ?? 1;
@@ -93,6 +100,19 @@ class Item {
     if (v && !hadParent) this._pendingTransfer = true;
   }
   getAttachments() { return this.attachments || []; }
+  /* 真实现是 `this.itemType === 'attachment'` 的语法糖（item.js）。照着写，
+     不另立一套判断 —— 两套迟早会分叉。 */
+  isAttachment() { return this.itemType === "attachment"; }
+  isNote() { return this.itemType === "note"; }
+  /* 批注也得有这一条，否则「全库扫要滤掉批注」那条测试在 stub 里根本没机会跑到 ——
+     而真机上它恰恰是最贵的那一步：10030 条批注，每条白跑一次 getAttachments()。
+     注意夹具要**显式写 itemType: "annotation"**：上面的 TYPE_ID 是随便定的，
+     跟真机对不上（真机是 annotation=1 / attachment=3 / book=7 / note=28，
+     这里为了可读性各排各的）—— 所以判据只能走 itemType 字符串，别拿 ID 比。 */
+  isAnnotation() { return this.itemType === "annotation"; }
+  /* 真实现会解析链接附件和相对路径，拿不到（文件不在本地）时返回 false。
+     夹具用 filePath 给出结果；不给就返回 false，走"没有本地文件"那条分支。 */
+  getFilePathAsync() { return Promise.resolve(this.filePath || false); }
   /* 真实现（item.js:4975）拿到非数字 ID 会抛 `Invalid collection 'undefined'`，
      这里**照抄那个校验**。抄之前 stub 是来者不拒的，于是"插件传了 undefined"
      在测试里完全看不出来 —— 而这正是真机上 addToCollection 从来没成功过的原因。 */
@@ -130,6 +150,27 @@ class Item {
     return Promise.resolve();
   }
 }
+
+/* ---- enrich 用的附件。先在这里建好，下面的条目才能引用它们的 itemID。
+   字符数照着真机量到的量级给：真扫描件是 0 或几十个噪声字符，正常书几万起步，
+   中间是空的 —— 所以阈值 1000 不用精细调（prefs.js 里那句注释说的就是这个）。 ---- */
+const EN_ATT_SCAN = new Item({ key: "ENATSCAN", itemType: "attachment", itemTypeID: 3,
+  attachmentContentType: "application/pdf", attachmentFilename: "计算土力学.pdf",
+  filePath: "C:\\Zotero\\storage\\ENATSCAN\\计算土力学.pdf", textChars: 0, indexState: 2 });
+const EN_ATT_TEXT = new Item({ key: "ENATTEXT", itemType: "attachment", itemTypeID: 3,
+  attachmentContentType: "application/pdf", attachmentFilename: "正常书.pdf",
+  filePath: "C:\\Zotero\\storage\\ENATTEXT\\正常书.pdf", textChars: 97248, indexState: 3 });
+// 有 23.6 万字符却仍是 PARTIAL —— 这条就是「state 不能当判据」的活证据
+const EN_ATT_PARTIAL = new Item({ key: "ENATPART", itemType: "attachment", itemTypeID: 3,
+  attachmentContentType: "application/pdf", attachmentFilename: "个别页没字.pdf",
+  filePath: "C:\\Zotero\\storage\\ENATPART\\个别页没字.pdf", textChars: 236341, indexState: 2 });
+// 非 PDF 不该进候选
+const EN_ATT_NONPDF = new Item({ key: "ENATHTML", itemType: "attachment", itemTypeID: 3,
+  attachmentContentType: "text/html", attachmentFilename: "网页快照.html" });
+// 抽全文时炸了的附件：要如实报出来，不能当成"字符数 0 = 扫描件"
+const EN_ATT_BROKEN = new Item({ key: "ENATBROK", itemType: "attachment", itemTypeID: 3,
+  attachmentContentType: "application/pdf", attachmentFilename: "坏文件.pdf",
+  textError: "file not found" });
 
 const ITEMS = {
   MASTER01: new Item({ key: "MASTER01", itemType: "journalArticle", fields: { title: "某篇论文", date: "2022", volume: "59", issue: "3", pages: "1-9" }, attachments: [1, 2], collections: ["C1"] }),
@@ -201,6 +242,51 @@ const ITEMS = {
     fields: { title: "作者 - 年 - 标题.pdf" }, attPath: "storage:作者 - 年 - 标题.pdf", parentItemID: 1001 }),
   ATT_DUP_B: new Item({ key: "ATT_DUPB", itemType: "attachment", itemTypeID: 3,
     fields: { title: "作者 - 年 - 标题.pdf" }, attPath: "storage:作者 - 年 - 标题.pdf", parentItemID: 1001 }),
+
+  /* ---- enrich 的夹具。每一条都对应 2026-09-12 真机跑出来的一个案例 ---- */
+
+  EN_ATT_SCAN, EN_ATT_TEXT, EN_ATT_PARTIAL, EN_ATT_NONPDF, EN_ATT_BROKEN,
+
+  // 正常补全：扫描书缺 publisher / date / ISBN / creators，视觉读到了封面 + 版权页
+  EN_BOOK: new Item({ key: "EN_BOOK", itemType: "book",
+    fields: { title: "计算土力学" }, attachments: [EN_ATT_SCAN.itemID] }),
+  // 库里标题**更全**：视觉那张扉页只印了主标题，跟视觉会把副标题截掉
+  EN_LONGTITLE: new Item({ key: "EN_LONGT", itemType: "book",
+    fields: { title: "从抛物线谈起：混沌动力学引论" } }),
+  // 抽出来的**更全**：这条才该写（extend）
+  EN_SHORTTITLE: new Item({ key: "EN_SHORT", itemType: "book",
+    fields: { title: "从抛物线谈起" } }),
+  /* 82L9PCBI：期刊论文，视觉读的是它参考文献里那本书。
+     三道闸里**只有闸三拦得住** —— 闸二也能过，因为文章标题
+     《对〈弹性力学简明教程〉中一处内容的商榷》里确实含「弹性力学简明教程」。 */
+  EN_HALLU_REF: new Item({ key: "EN_HALLU", itemType: "journalArticle",
+    fields: { title: "对《弹性力学简明教程》中一处内容的商榷", date: "2009" } }),
+  // H2GCDM5B：出版社是从前言的一句致谢里抠的，页类型只有正文/目录 —— 闸一拦
+  EN_HALLU_ACK: new Item({ key: "EN_HALLUA", itemType: "book",
+    fields: { title: "数学物理方程的matlab解法与可视化" } }),
+  // 两边都有值且不同 —— 挂起，不写
+  EN_CONFLICT: new Item({ key: "EN_CONF", itemType: "book",
+    fields: { title: "土的本构关系", ISBN: "978-7-114-14996-2" } }),
+  // 影印本 vs 原版的版次分歧：库里 "原书2"，视觉读出 "第1版"
+  EN_EDITION: new Item({ key: "EN_EDIT", itemType: "book",
+    fields: { title: "利用Python进行数据分析", edition: "原书2" } }),
+  // creators 库里已经有了，就不动
+  EN_HASCREATOR: new Item({ key: "EN_HASCR", itemType: "book",
+    fields: { title: "已经有作者的书" },
+    creators: [{ creatorType: "author", fieldMode: 1, lastName: "张三" }] }),
+  // series 只列不写
+  EN_SERIES: new Item({ key: "EN_SERI", itemType: "book",
+    fields: { title: "带丛书的书" } }),
+  // 学位论文：视觉抽到的那个"出版社"其实是学位授予单位 → 映射到 university
+  EN_THESIS: new Item({ key: "EN_THES", itemType: "thesis",
+    fields: { title: "某篇学位论文" } }),
+  // 字段已经齐了 —— 不该进候选。它身上挂的是**正常有文本层**的 PDF（EN_ATT_TEXT），
+  // 于是顺带钉住粗筛：scan=1 全库扫时，这个附件该被 getIndexedState 挡在 getFullText 之前，
+  // 而不是白白抽一遍全文再发现「有字」。
+  EN_COMPLETE: new Item({ key: "EN_CMPL", itemType: "book",
+    fields: { title: "什么都不缺的书", publisher: "某社", date: "2020", ISBN: "978-0-00-000000-0" },
+    creators: [{ creatorType: "author", fieldMode: 1, lastName: "李四" }],
+    attachments: [EN_ATT_TEXT.itemID] }),
 };
 
 const Zotero = {
@@ -263,10 +349,43 @@ const Zotero = {
     getByLibraryAndKey: (lib, key) => COLLECTIONS.find(c => c.key === key) || null,
   },
   Items: {
-    getByLibraryAndKeyAsync: async (lib, key) => ITEMS[key] || null,
+    /* 认的是 item.key，**不是对象属性名** —— 真机的 getByLibraryAndKey 就是按 key 查的。
+       之前写成 `ITEMS[key]`，于是夹具的属性名和 key 一旦不一致就静默查不到，
+       表现是端点上那句"条目不存在"，而不是抛错，很难看出是 stub 的问题。 */
+    getByLibraryAndKeyAsync: async (lib, key) => byItemKey(key),
     getAsync: async (ids) => (ids || []).map(id => byItemID(id)),
     get: (id) => byItemID(id),
+    // 签名照真实现：(libraryID, onlyTopLevel, includeDeleted, asIDs)
+    getAll: (lib, onlyTopLevel, includeDeleted, asIDs) => {
+      let all = Object.values(ITEMS).filter(i => includeDeleted || !i.deleted);
+      if (onlyTopLevel) all = all.filter(i => !i.parentItemID);
+      return asIDs ? all.map(i => i.itemID) : all;
+    },
     merge: () => { throw new Error("不该走 deprecated 路径"); },
+  },
+  /* 全文索引状态的替身。真实分布（2026-09-12 实测 1235 个 PDF）：
+     INDEXED 1035 / PARTIAL 173 / UNINDEXED 27。
+     ⚠️ PARTIAL **不是"扫描件"的意思** —— 实测 23NZF8PY（10.0 万字符）与
+     27RCEEVC（29.7 万字符）都是 PARTIAL，只因个别页没字；而 2J4LLG6Q（0 字符）
+     和 4BY9B5LC（0 字符）同为纯扫描件，一个判 UNINDEXED 一个判 PARTIAL。
+     所以找候选的判据用 PDFWorker.getFullText 的字符数，**不用这里的 state**。 */
+  Fulltext: {
+    INDEX_STATE_UNAVAILABLE: 0, INDEX_STATE_UNINDEXED: 1, INDEX_STATE_PARTIAL: 2,
+    INDEX_STATE_INDEXED: 3, INDEX_STATE_QUEUED: 4,
+    getIndexedState: async (a) => (a.indexState === undefined ? 3 : a.indexState),
+  },
+  // getFullText 的替身：夹具给 textChars（字符数）或 textError（抛错）
+  PDFWorker: {
+    getFullText: async (id) => {
+      const a = byItemID(id);
+      if (!a) throw new Error("no such item: " + id);
+      if (a.textError) throw new Error(a.textError);
+      return { text: "字".repeat(a.textChars === undefined ? 50000 : a.textChars) };
+    },
+  },
+  Attachments: {
+    // 真实现返回 nsIFile；被测代码只读 .path，给个带 path 的替身就够
+    getStorageDirectory: (a) => ({ path: "C:\\Zotero\\storage\\" + a.key }),
   },
   Server: { Endpoints: {} },
   DB: {
@@ -334,6 +453,8 @@ const COLLECTIONS = [
 
 const byItemID = (id) =>
   Object.values(ITEMS).find(it => it.itemID === Number(id)) || null;
+const byItemKey = (key) =>
+  Object.values(ITEMS).find(it => it.key === String(key)) || null;
 
 function collectionsOfItem(itemID) {
   const it = byItemID(itemID);
@@ -637,10 +758,10 @@ const t = async (name, fn) => {
   });
 
   console.log("\n[1] 端点注册");
-  await t("七个路径都注册上了", () => {
+  await t("八个路径都注册上了", () => {
     assert.deepStrictEqual(Object.keys(EP).sort(),
-      ["/zoterojs/apply", "/zoterojs/doctor", "/zoterojs/exec", "/zoterojs/logs",
-        "/zoterojs/merge", "/zoterojs/ping", "/zoterojs/query"]);
+      ["/zoterojs/apply", "/zoterojs/doctor", "/zoterojs/enrich", "/zoterojs/exec",
+        "/zoterojs/logs", "/zoterojs/merge", "/zoterojs/ping", "/zoterojs/query"]);
   });
   await t("都是构造函数（server.js 里是 new this.endpoint()）", () => {
     for (const p of Object.keys(EP)) assert.ok(typeof new EP[p]().init === "function");
@@ -977,8 +1098,10 @@ const t = async (name, fn) => {
   await t("面板每个 preference= 都在 prefs.js 里有默认值", () => {
     // 先剥掉 XML 注释 —— 注释里那句 preference="..." 是说明文字，不是绑定
     const x = fs.readFileSync(path.join(ADDON, "prefs.xhtml"), "utf8").replace(/<!--[\s\S]*?-->/g, "");
-    // 十二个可调参数：总开关、只读、七个端点、响应上限、备份开关与保留份数。
+    // 十三个可调参数：总开关、只读、八个端点、响应上限、备份开关与保留份数。
     // token 不在其中 —— 那个框是只读展示，由 JSBridge.refreshTokenView 填，不走 preference 绑定。
+    // enrich 的 minChars 也不在：它没做成面板控件（改的人先得知道自己在改什么），
+    // 只由 prefs.js 给默认值，需要时用 about:config 调。
     const WANT = [
       "extensions.zotero.jsbridge.enabled",
       "extensions.zotero.jsbridge.readonly",
@@ -989,6 +1112,7 @@ const t = async (name, fn) => {
       "extensions.zotero.jsbridge.endpoint.query",
       "extensions.zotero.jsbridge.endpoint.doctor",
       "extensions.zotero.jsbridge.endpoint.apply",
+      "extensions.zotero.jsbridge.endpoint.enrich",
       "extensions.zotero.jsbridge.limit.responseKB",
       "extensions.zotero.jsbridge.backup.enabled",
       "extensions.zotero.jsbridge.backup.keep",
@@ -1024,7 +1148,7 @@ const t = async (name, fn) => {
       assert.strictEqual(typeof pane()[f], "function", `缺 ${f}`);
     }
   });
-  await t("自检报出七个端点、总开关、只读、token 文件和备份状态", async () => {
+  await t("自检报出八个端点、总开关、只读、token 文件和备份状态", async () => {
     const doc = fakeDoc();
     await pane().selfCheck(doc);
     const out = doc.els["jsb-status"].textContent;
@@ -1071,7 +1195,7 @@ const t = async (name, fn) => {
     assert.strictEqual(stale[0], 403, "旧 token 还能用");
   });
 
-  await t("总开关关掉 → 七个端点全 503，且说得出是哪个开关", () =>
+  await t("总开关关掉 → 八个端点全 503，且说得出是哪个开关", () =>
     withPref("jsbridge.enabled", false, async () => {
       for (const p of Object.keys(EP)) {
         const r = await epCall(p, { method: "GET", headers: H,
@@ -1667,6 +1791,310 @@ const t = async (name, fn) => {
         "attachmentTitle", "duplicateFilenames", "duplicates", "trashWriteback"])) });
     assert.deepStrictEqual(httpCalls, []);
   });
+
+  console.log("\n[8.85] enrich：只补空 + 三道闸");
+
+  const enrich = async (data) => {
+    const r = await epCall("/zoterojs/enrich", { headers: H, data });
+    return { status: r[0], body: JSON.parse(r[2]) };
+  };
+  // 一条视觉结果的样板。各用例只覆盖自己关心的那几个字段。
+  const finding = (key, over) => Object.assign({
+    item: key, pages: [{ p: 1, type: "封面" }, { p: 3, type: "版权页CIP" }],
+    evidence: "计算土力学/朱百里. —北京：中国建筑工业出版社，2019.3",
+  }, over || {});
+  const applyOf = (b) => (b.apply && b.apply.report) || [];
+  const opFor = (b, key) => applyOf(b).find(r => r.item === key) || null;
+  const fieldsOf = (b, key) => (opFor(b, key) || {}).changes || [];
+
+  await t("正常补全：缺的字段全补上，dry-run 一条也不落盘", async () => {
+    const before = saveTxCalls.length;
+    const { status, body } = await enrich({ dryRun: true, findings: [finding("EN_BOOK", {
+      title: "计算土力学", publisher: "中国建筑工业出版社", place: "北京",
+      year: "2019", month: 3, edition: "第1版", isbn: "978-7-112-00000-0", authors: ["朱百里"],
+    })] });
+    assert.strictEqual(status, 200);
+    assert.strictEqual(body.gated, 0, "不该被闸门拦下");
+    assert.strictEqual(body.withOps, 1);
+    const got = {}; for (const c of fieldsOf(body, "EN_BOOK")) got[c.field] = c.to;
+    assert.strictEqual(got.publisher, "中国建筑工业出版社");
+    assert.strictEqual(got.place, "北京");
+    assert.strictEqual(got.date, "2019-03", "年 + 月要拼成 YYYY-MM");
+    assert.strictEqual(got.ISBN, "978-7-112-00000-0");
+    // creators 的 to 是**数组**（一条 op 里可以设多位作者），不是字符串
+    assert.deepStrictEqual(got.creators, ["朱百里"]);
+    assert.strictEqual(saveTxCalls.length, before, "演练模式一个字都不该写");
+  });
+
+  await t("★ 闸三挡住「参考文献里的那本书」（真机上的 82L9PCBI）", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_HALLU", {
+      // 依据行是 GB/T 7714 参考文献格式，模型还把它判成了"版权页CIP"
+      pages: [{ p: 3, type: "版权页CIP" }],
+      title: "弹性力学简明教程", publisher: "高等教育出版社", place: "北京",
+      year: "2002", month: 8, edition: "第3版", isbn: "7-04-010719-8",
+      evidence: "弹性力学简明教程/徐芝纶. —3版. 北京:高等教育出版社,2002.8",
+    })] });
+    assert.strictEqual(body.gated, 1, "期刊论文身上出现了出版社 / ISBN，必须拦下");
+    assert.strictEqual(body.withOps, 0, "拦下的不该生成任何 op");
+    assert.match(body.gatedReport[0].why.join(" "), /期刊论文/);
+    // 这条闸二**过不了**它 —— 特意钉住：光靠标题子串校验是不够的
+    assert.ok(body.gatedReport[0].why.every(w => !/书名/.test(w)),
+      "闸二本该放行（文章标题里确实含「弹性力学简明教程」），拦下它的只能是闸三");
+  });
+
+  await t("★ 闸一挡住「前言致谢里抠出来的出版社」（真机上的 H2GCDM5B）", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_HALLUA", {
+      pages: [{ p: 1, type: "正文" }, { p: 2, type: "目录" }],   // 一页前置页都没见到
+      title: "数学物理方程的matlab解法与可视化", publisher: "清华大学出版社",
+      evidence: "本书作者感谢清华大学出版社对本书出版所给予的大力支持",
+    })] });
+    assert.strictEqual(body.gated, 1);
+    assert.match(body.gatedReport[0].why.join(" "), /没见到前置页/);
+    assert.strictEqual(body.withOps, 0);
+  });
+
+  await t("strict=false 时闸门放开（反面证明闸真的在起作用，不是摆设）", async () => {
+    const { body } = await enrich({ dryRun: true, strict: false, findings: [finding("EN_HALLUA", {
+      pages: [{ p: 1, type: "正文" }], title: "数学物理方程的matlab解法与可视化",
+      publisher: "清华大学出版社", evidence: "本书作者感谢清华大学出版社…",
+    })] });
+    assert.strictEqual(body.gated, 0);
+    assert.strictEqual(body.withOps, 1, "关掉闸门后同一条应该能过 —— 否则说明拦住它的不是闸门");
+  });
+
+  await t("★ 库里标题更全时不许截短（「从抛物线谈起：混沌动力学引论」）", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_LONGT", {
+      title: "从抛物线谈起",        // 视觉那张扉页只印了主标题
+    })] });
+    assert.strictEqual(body.withOps, 0, "跟着视觉写会把副标题丢掉");
+    const row = body.report[0].fields.find(r => r.field === "title");
+    assert.strictEqual(row.kind, "same");
+    assert.strictEqual(row.from, "从抛物线谈起：混沌动力学引论");
+  });
+
+  await t("反过来：抽出来的更全时才写（extend）", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_SHORT", {
+      title: "从抛物线谈起：混沌动力学引论",
+    })] });
+    const row = body.report[0].fields.find(r => r.field === "title");
+    assert.strictEqual(row.kind, "extend");
+    assert.strictEqual(opFor(body, "EN_SHORT").changes
+      .find(c => c.field === "title").to, "从抛物线谈起：混沌动力学引论");
+  });
+
+  await t("★ 两边都有值且不同 → conflict，只报不写", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_CONF", {
+      title: "土的本构关系", isbn: "978-7-114-08257-3",         // 库里是 ...14996-2
+      publisher: "人民交通出版社",
+    })] });
+    const rows = Object.fromEntries(body.report[0].fields.map(r => [r.field, r]));
+    assert.strictEqual(rows.ISBN.kind, "conflict");
+    assert.strictEqual(rows.ISBN.from, "978-7-114-14996-2");
+    assert.strictEqual(rows.ISBN.to, "978-7-114-08257-3");
+    const changed = opFor(body, "EN_CONF").changes.map(c => c.field);
+    assert.ok(!changed.includes("ISBN"), "冲突字段绝不能进 op");
+    assert.ok(changed.includes("publisher"), "空着的字段照补");
+  });
+
+  await t("版次分歧（原书2 vs 第1版）也走 conflict，不是静默覆盖", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_EDIT", {
+      title: "利用Python进行数据分析", edition: "第1版",
+    })] });
+    const row = body.report[0].fields.find(r => r.field === "edition");
+    assert.strictEqual(row.kind, "conflict");
+    assert.strictEqual(body.withOps, 0);
+  });
+
+  await t("series 只列不写（模型把资助项目 / 文献类型都当成了丛书）", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_SERI", {
+      title: "带丛书的书", series: "国家自然科学基金重大项目",
+    })] });
+    const row = body.report[0].fields.find(r => r.field === "series");
+    assert.strictEqual(row.kind, "review");
+    assert.strictEqual(body.withOps, 0, "series 不该生成 op");
+  });
+
+  await t("creators 库里已经有了就不动它", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_HASCR", {
+      title: "已经有作者的书", authors: ["王五", "赵六"],
+    })] });
+    const row = body.report[0].fields.find(r => r.field === "creators");
+    assert.strictEqual(row.kind, "same");
+    assert.strictEqual(row.from, "张三");
+    assert.strictEqual(body.withOps, 0);
+  });
+
+  await t("学位论文：抽到的「出版社」落到 university，不是 publisher", async () => {
+    const { body } = await enrich({ dryRun: true, findings: [finding("EN_THES", {
+      title: "某篇学位论文", publisher: "清华大学", year: "2018",
+    })] });
+    const changed = Object.fromEntries(fieldsOf(body, "EN_THES").map(c => [c.field, c.to]));
+    assert.strictEqual(changed.university, "清华大学");
+    assert.strictEqual(changed.publisher, undefined, "学位论文没有 publisher 这个栏");
+  });
+
+  await t("dryRun=false 才真落盘，且用 enrich 这个 tag 备份", async () => {
+    const before = saveTxCalls.length;
+    const { body } = await enrich({ dryRun: false, findings: [finding("EN_BOOK", {
+      title: "计算土力学", publisher: "中国建筑工业出版社", year: "2019",
+    })] });
+    assert.strictEqual(body.apply.dryRun, false);
+    assert.strictEqual(body.apply.applied, 1);
+    assert.ok(saveTxCalls.length > before, "真写应该落盘");
+    assert.ok(saveTxCalls.includes("EN_BOOK"));
+  });
+
+  await t("findings 为空时报 400 并说清两种用法", async () => {
+    const { status, body } = await enrich({ findings: [] });
+    assert.strictEqual(status, 400);
+    assert.match(body.error, /items=|scan=1/);
+  });
+
+  await t("条目不存在 → 进 errorReport，不影响同批其他条目", async () => {
+    // 用本测试自己的一条条目，不蹭 EN_BOOK：上一条真落盘（dryRun=false）已经把
+    // publisher 写进 EN_BOOK 了，再喂一个不同的出版社就变成 conflict —— 那样
+    // withOps 是 0，"好的那条照常处理"这句断言测的就不是它想测的东西了。
+    ITEMS.EN_TMPERR = new Item({ key: "EN_TMPERR", itemType: "book",
+      fields: { title: "同批里好的那条" } });
+    try {
+      const { status, body } = await enrich({ dryRun: true, findings: [
+        finding("NOSUCHKEY"),
+        finding("EN_TMPERR", { title: "同批里好的那条", publisher: "某社" }),
+      ] });
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.errors, 1);
+      assert.match(body.errorReport[0].why, /不存在/);
+      assert.strictEqual(body.withOps, 1, "好的那条照常处理");
+    } finally { delete ITEMS.EN_TMPERR; }
+  });
+
+  console.log("\n[8.86] enrich 的候选发现");
+
+  await t("点名模式：只回报没有文本层的 PDF", async () => {
+    const r = await epCall("/zoterojs/enrich", { headers: H,
+      searchParams: new URLSearchParams("items=EN_BOOK") });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.candidates, 1, "EN_BOOK 的扫描件字符数是 0，该进候选");
+    assert.strictEqual(b.page[0].atts.length, 1);
+    assert.strictEqual(b.page[0].atts[0].akey, "ENATSCAN");
+    assert.strictEqual(b.page[0].atts[0].chars, 0);
+    assert.match(b.page[0].atts[0].file, /ENATSCAN/, "要给出附件的真实路径");
+  });
+
+  await t("★ 有文本层的不进候选 —— 哪怕它的 state 是 PARTIAL", async () => {
+    // EN_ATT_PARTIAL 有 23.6 万字符却仍是 PARTIAL。拿 state 当判据的话它会误报，
+    // 而这正是不能信 getIndexedState 的原因（真机上 23NZF8PY / 27RCEEVC 就是这情况）。
+    const nonPdf = new Item({ key: "EN_TMP1", itemType: "book", fields: { title: "拿 PARTIAL 的文件" },
+      attachments: [EN_ATT_PARTIAL.itemID] });
+    ITEMS.EN_TMP1 = nonPdf;
+    try {
+      const r = await epCall("/zoterojs/enrich", { headers: H,
+        searchParams: new URLSearchParams("items=EN_TMP1") });
+      const b = JSON.parse(r[2]);
+      assert.strictEqual(b.candidates, 0,
+        "23.6 万字符的附件被当成了扫描件 —— 判据退回了 getIndexedState");
+    } finally { delete ITEMS.EN_TMP1; }
+  });
+
+  await t("非 PDF 附件不进候选", async () => {
+    const it = new Item({ key: "EN_TMP2", itemType: "book", fields: { title: "只有网页快照" },
+      attachments: [EN_ATT_NONPDF.itemID] });
+    ITEMS.EN_TMP2 = it;
+    try {
+      const r = await epCall("/zoterojs/enrich", { headers: H,
+        searchParams: new URLSearchParams("items=EN_TMP2") });
+      assert.strictEqual(JSON.parse(r[2]).candidates, 0);
+    } finally { delete ITEMS.EN_TMP2; }
+  });
+
+  await t("★ 抽全文失败要如实报，不能当成「0 字符 = 扫描件」", async () => {
+    const it = new Item({ key: "EN_TMP3", itemType: "book", fields: { title: "坏文件" },
+      attachments: [EN_ATT_BROKEN.itemID] });
+    ITEMS.EN_TMP3 = it;
+    try {
+      const r = await epCall("/zoterojs/enrich", { headers: H,
+        searchParams: new URLSearchParams("items=EN_TMP3") });
+      const att = JSON.parse(r[2]).page[0].atts[0];
+      assert.strictEqual(att.chars, null, "抽不出来就是 null，不能填 0");
+      assert.match(att.error, /file not found/);
+    } finally { delete ITEMS.EN_TMP3; }
+  });
+
+  await t("字段已经齐了的条目不进候选（视觉没得补）", async () => {
+    const r = await epCall("/zoterojs/enrich", { headers: H,
+      searchParams: new URLSearchParams("items=EN_CMPL") });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.candidates, 0);
+    /* 上面那个 0 得说得出是**哪道闸**挡的 —— 光看 candidates=0 分不清
+       "字段齐了"、"没挂附件"、"附件没文本层" 还是 "根本没扫到它"。
+       EN_CMPL 身上挂着 EN_ATT_TEXT（9.7 万字符的正常 PDF），所以：
+         · 默认（missingOnly=1）：在附件循环**之前**就 continue 了 → attsProbed 必须是 0
+         · missingOnly=0：过字段闸、真去查了那个附件 → attsProbed=1，
+           仍因字符数够多而不进候选
+       两个数合起来才钉死"是字段闸干的"，而不是哪一环悄悄没跑。
+       （这条原来附了一句「EN_CMPL 没挂附件，本来就不该出现」—— 夹具给它挂上
+        EN_ATT_TEXT 之后那句就成了假话。**失败信息说假话比没有失败信息更坏**：
+        哪天它红了，你会去查一个根本不存在的原因。） */
+    assert.strictEqual(b.attsProbed, 0, "字段齐了就该在附件循环之前 continue");
+    const r2 = await epCall("/zoterojs/enrich", { headers: H,
+      searchParams: new URLSearchParams("items=EN_CMPL&missingOnly=0") });
+    const b2 = JSON.parse(r2[2]);
+    assert.strictEqual(b2.attsProbed, 1, "missingOnly=0 时要真的去查那个附件");
+    assert.strictEqual(b2.candidates, 0, "9.7 万字符的 PDF 不该进候选");
+  });
+
+  await t("既不给 items 也不给 scan → 400，并把两种用法说清楚", async () => {
+    const r = await epCall("/zoterojs/enrich", { headers: H });
+    assert.strictEqual(r[0], 400);
+    assert.match(JSON.parse(r[2]).error, /items=KEY1,KEY2/);
+  });
+
+  await t("scan=1 全库扫：只要有文本层的都被粗筛跳过，不白抽", async () => {
+    const r = await epCall("/zoterojs/enrich", { headers: H,
+      searchParams: new URLSearchParams("scan=1&missingOnly=0") });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(r[0], 200);
+    assert.ok(b.skippedIndexed >= 1, "INDEXED 的附件该被 getIndexedState 粗筛掉");
+    assert.ok(b.candidates >= 1, "至少 EN_BOOK 该进候选");
+  });
+
+  await t("★ 全库扫要滤掉批注 —— getAll 会把它们算成顶层条目", async () => {
+    /* 真机实测（2026-09-12）：Zotero.Items.getAll(lib, true) = 11231，
+       其中 **10030 条是 annotation** —— 它只 LEFT JOIN 了 itemNotes 和
+       itemAttachments，没 join itemAnnotations。不滤掉的话两个后果：
+       ① 每条批注白跑一次 getAttachments()，实测那一步直接超时；
+       ② itemsProbed 报 11231，看着像"扫了一万多个条目"，而真正的书目条目
+          只有 1197 —— 数字骗人比慢更糟。 */
+    ITEMS.EN_TMPANN = new Item({ key: "EN_TMPANN", itemType: "annotation",
+      fields: { title: "一条高亮" }, attachments: [] });
+    try {
+      const r = await epCall("/zoterojs/enrich", { headers: H,
+        searchParams: new URLSearchParams("scan=1&missingOnly=0") });
+      const b = JSON.parse(r[2]);
+      assert.ok(!b.page.some(c => c.item === "EN_TMPANN"), "批注不该出现在候选里");
+      const topAll = Object.values(ITEMS).filter(i => !i.parentItemID).length;
+      assert.ok(b.itemsProbed < topAll,
+        `itemsProbed(${b.itemsProbed}) 要小于 getAll 的顶层数(${topAll})` +
+        " —— 相等就说明批注没被滤掉");
+    } finally { delete ITEMS.EN_TMPANN; }
+  });
+
+  await t("只读模式下 enrich 回 403（POST 和 GET 都算写）", () =>
+    withPref("jsbridge.readonly", true, async () => {
+      assert.strictEqual((await epCall("/zoterojs/enrich",
+        { headers: H, data: { findings: [finding("EN_BOOK")] } }))[0], 403);
+      assert.strictEqual((await epCall("/zoterojs/enrich", { headers: H,
+        searchParams: new URLSearchParams("items=EN_BOOK") }))[0], 403,
+        "GET 的 scan 模式要抽几百个附件、耗时以分钟计，也不该放行");
+    }));
+
+  await t("端点在面板开关里能关掉，ping 会把它列进 disabled", () =>
+    withPref("jsbridge.endpoint.enrich", false, async () => {
+      assert.strictEqual((await epCall("/zoterojs/enrich",
+        { headers: H, data: { findings: [finding("EN_BOOK")] } }))[0], 404);
+      const ping = await epCall("/zoterojs/ping", { method: "GET", headers: {} });
+      assert.ok(JSON.parse(ping[2]).disabled.includes("/zoterojs/enrich"));
+    }));
 
   console.log("\n[8.9] stub 自检：没人接的 SQL");
   await t("跑过的每条 SQL 都被 stub 认出来了", () => {

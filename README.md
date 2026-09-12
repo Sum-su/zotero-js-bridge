@@ -8,7 +8,7 @@ storage backends, bulk-editing fields, calling internal modules — can only be
 done from inside the Zotero process. Normally that means opening
 **Tools → Developer → Run JavaScript** and pasting code by hand, every time.
 
-This plugin opens seven local HTTP endpoints on the HTTP server Zotero already
+This plugin opens eight local HTTP endpoints on the HTTP server Zotero already
 runs (`127.0.0.1:23119`), so a script can do it instead.
 
 ```console
@@ -24,9 +24,9 @@ $ python zoterojs.py apply ops.json                     # dry-run until you pass
 $ python zoterojs.py backup                             # VACUUM INTO + rotation
 ```
 
-Three of the seven can write (`exec` / `merge` / `apply`); the other four are
-read-only (`ping` / `logs` / `query` / `doctor`). Read-only mode closes the
-write paths and leaves the read ones open.
+Four of the eight can write (`exec` / `merge` / `apply` / `enrich`); the other
+four are read-only (`ping` / `logs` / `query` / `doctor`). Read-only mode closes
+the write paths and leaves the read ones open.
 
 > [!WARNING]
 > These endpoints execute **arbitrary JavaScript inside Zotero** with full
@@ -38,7 +38,7 @@ write paths and leaves the read ones open.
 
 - Zotero 7 or later (developed and verified against **Zotero 10.0.2**)
 - Python 3.8+ for the bundled client (any HTTP client works — the protocol is
-  seven JSON endpoints)
+  eight JSON endpoints)
 
 ## Install
 
@@ -62,6 +62,9 @@ python zoterojs.py merge MASTERKEY DUPKEY --dry-run
 python zoterojs.py query --title 物理化学 --limit 20
 python zoterojs.py doctor [duplicates orphanStorage] [--all] [--days 30]
 python zoterojs.py apply ops.json [--yes] [--keep-going]
+python zoterojs.py enrich --items KEY1,KEY2      # who needs OCR/vision
+python zoterojs.py enrich --scan                 # ... across the whole library
+python zoterojs.py enrich findings.json [--yes]  # write back what vision read
 python zoterojs.py backup
 ```
 
@@ -79,6 +82,8 @@ zjs.merge("IJKL9012", ["MNOP3456"], dry_run=True)   # self-check only
 zjs.query(title="导水裂隙带", limit=5)               # structured, no SQL
 zjs.doctor()                                        # full sweep, no network
 zjs.apply(ops, dry_run=True)                        # dry run is the default here too
+zjs.enrich(items=["ABCD1234"])                      # does this PDF need OCR?
+zjs.enrich(findings=read_from_vision)               # fill only the empty fields
 zjs.backup()                                        # VACUUM INTO + rotation
 ```
 
@@ -97,8 +102,9 @@ response). Top-level `await` and `return` both work.
 | GET, POST | `/zoterojs/query` | `X-ZoteroJS-Token` |
 | GET, POST | `/zoterojs/doctor` | `X-ZoteroJS-Token` |
 | POST | `/zoterojs/apply` | `X-ZoteroJS-Token` |
+| GET, POST | `/zoterojs/enrich` | `X-ZoteroJS-Token` |
 
-All seven ride on Zotero's own server — nothing new is bound, and no socket is
+All eight ride on Zotero's own server — nothing new is bound, and no socket is
 held open, so Zotero still exits cleanly.
 
 Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin`
@@ -117,8 +123,8 @@ on the next call.
 
 | Pref (`extensions.zotero.jsbridge.…`) | Default | Effect when changed |
 | --- | --- | --- |
-| `enabled` | `true` | `false` → all seven endpoints return `503` |
-| `readonly` | `false` | `true` → `exec` / `merge` / `apply` return `403`; reads still work |
+| `enabled` | `true` | `false` → all eight endpoints return `503` |
+| `readonly` | `false` | `true` → `exec` / `merge` / `apply` / `enrich` return `403`; reads still work |
 | `endpoint.ping` | `true` | `false` → that path returns `404` |
 | `endpoint.exec` | `true` | |
 | `endpoint.merge` | `true` | |
@@ -126,6 +132,8 @@ on the next call.
 | `endpoint.query` | `true` | |
 | `endpoint.doctor` | `true` | |
 | `endpoint.apply` | `true` | |
+| `endpoint.enrich` | `true` | |
+| `enrich.minChars` | `1000` | Below this extracted char count a PDF counts as having no text layer |
 | `limit.responseKB` | `1500` | Response cap, clamped to 10–20000 |
 | `backup.enabled` | `false` | `true` → back up before every `merge` / `apply` |
 | `backup.keep` | `5` | How many backups to keep, clamped to 1–200 |
@@ -145,7 +153,7 @@ predate them see the same shape they always did.
 
 The pane also carries the token (copy / regenerate / rewrite the token file),
 a **Backup now** button, and a **self-check** button that reports whether the
-seven endpoints are
+eight endpoints are
 registered, what the switches say, and whether the token file is there. The
 self-check is deliberately static: it does not fire an HTTP request at
 `127.0.0.1:23119`, because Zotero's own CSRF guard would kill it and a failure
@@ -156,10 +164,12 @@ Two things worth being precise about:
 - **Read-only mode is a refusal, not a sandbox.** It does not parse your code.
   There is no honest way to decide statically how many side effects a given
   `exec` can produce, so instead of pretending, it closes the write paths
-  entirely (`exec`, `merge`, `apply`, and `logs --clear`) and leaves the read
-  paths (`ping`, `logs`, `query`, `doctor`) open. `apply` is gated even for a
-  dry run: read-only means "this endpoint is not available", not "you may
-  rehearse".
+  entirely (`exec`, `merge`, `apply`, `enrich`, and `logs --clear`) and leaves
+  the read paths (`ping`, `logs`, `query`, `doctor`) open. `apply` and `enrich`
+  are gated even for a dry run: read-only means "this endpoint is not
+  available", not "you may rehearse". `enrich` counts as a write on both verbs,
+  even in its read-only discovery mode, because its `--scan` form extracts the
+  full text of a few hundred PDFs and takes minutes.
 - **The master switch is enforced on the request path, not at registration.**
   Disabling the bridge leaves the pane in place, which is the only way back —
   a plugin that removes its own settings UI when disabled can't be re-enabled
@@ -190,6 +200,117 @@ The ISBN check is the backstop for the classic disaster: two volumes of the
 same textbook with identical title and authors, differing only in ISBN and
 edition. `master` survives, duplicates go to the trash, and `Ctrl+Z`
 undoes it in Zotero.
+
+## The `enrich` endpoint
+
+For the tail of a library that can't be identified any other way: scanned PDFs
+with no text layer, where the only remaining source of metadata is what a human
+(or a vision model) can *see* on the cover and the copyright page. It has two
+modes and one rule.
+
+**The rule: fill empty fields, never overwrite.** Two-sided differences become
+`conflict` and are reported, not written. Overwriting is `apply`'s job, where
+you've said explicitly that you mean it.
+
+### Mode A — who needs vision (read-only)
+
+```bash
+python zoterojs.py enrich --items KEY1,KEY2   # name them (fast: ms per item)
+python zoterojs.py enrich --scan              # whole library (slow: see below)
+```
+
+The judge is the **extracted character count** from
+`Zotero.PDFWorker.getFullText`, not `Zotero.Fulltext.getIndexedState`. The
+index state cannot tell the two cases apart — measured on a real library, both
+of these come back `PARTIAL`:
+
+| Attachment | Extracted chars | `getIndexedState` |
+| --- | --- | --- |
+| `23NZF8PY` | 100,117 | `PARTIAL` — a normal book, one page has no text |
+| `27RCEEVC` | 297,684 | `PARTIAL` — same story |
+| `2J4LLG6Q` | 0 | `UNINDEXED` |
+| `4BY9B5LC` | 0 | `PARTIAL` |
+
+The last two are the same thing (pure scans) with *different* states, which is
+the whole argument. The threshold is `enrich.minChars` (default 1000): real
+scans come back at 0 or a few dozen junk chars, real papers at tens of
+thousands, and nothing lives in between, so it doesn't need tuning.
+
+Cost, measured over 1235 PDFs: `getFullText` is ~337 ms each (**~7 minutes**
+for the library), while `getIndexedState` is a pure DB read (198 ms for all of
+them). So `--scan` prefilters on the index state first — 1235 → 200, about 67
+seconds — and `--items` skips the prefilter entirely, because naming an item
+means you want *that* attachment's real answer.
+
+Rendering is deliberately **not** here: Zotero exposes no headless PDF
+renderer (`Zotero.PDFRenderer` doesn't exist, `Zotero.PDFWorker` has no render
+method). Turn the pages into images outside, with PyMuPDF or whatever you
+already use.
+
+### Mode B — write back what vision read (writable)
+
+```bash
+python zoterojs.py enrich findings.json [--yes]
+```
+
+`findings.json` is one entry per item:
+
+```json
+[{"item": "ABCD1234",
+  "pages": [{"p": 1, "type": "封面"}, {"p": 3, "type": "版权页CIP"}],
+  "title": "计算土力学", "publisher": "中国建筑工业出版社",
+  "year": "2019", "month": 3, "isbn": "978-7-112-00000-0",
+  "authors": ["朱百里"],
+  "evidence": "计算土力学/朱百里. —北京：中国建筑工业出版社，2019.3"}]
+```
+
+Dry-run by default, like `apply`. What each field turns into:
+
+| Kind | Condition | Action |
+| --- | --- | --- |
+| `new` | library empty | write |
+| `extend` | extracted title extends the library's ("从抛物线谈起" → "从抛物线谈起：混沌动力学引论") | write |
+| `same` | normalized-equal either way | nothing |
+| `conflict` | both have values, different | report only |
+| `review` | `series` | report only |
+| `suspect` | gate failed | not evaluated at all — see below |
+
+The title comparison normalizes whitespace, CJK and ASCII punctuation, and
+every dash variant, then checks substring containment in both directions. The
+`extend` direction is the only one that writes: a cover page that prints only
+the main title must not truncate a library title that carries the subtitle.
+
+### The three gates
+
+`strict` (the default) holds back any item that fails one of these:
+
+```text
+① saw front matter — 封面 / 书名页 / 扉页 / 版权页 / CIP / 题名页
+② the extracted title matches the item's title (normalized substring, either way)
+③ no ISBN / publisher / edition / series on a journalArticle
+```
+
+These aren't theory. Both were caught on a real library:
+
+- `82L9PCBI` — a journal article whose metadata came from **a bibliography
+  line** in its own reference list, which the model reported as "版权页CIP"
+  with publisher and ISBN attached. Gate ② **passes** it: the article's title
+  genuinely contains the book title it cites. Only gate ③ catches it.
+- `H2GCDM5B` — a publisher extracted from an acknowledgment sentence
+  ("本书作者感谢清华大学出版社…"), with page types of only 正文 and 目录. Only
+  gate ① catches it.
+
+Items that fail a gate land in `gatedReport` with the reasons and the source
+line, and produce no ops at all. `strict=false` exists to *prove* the gates
+work (the same input should then pass) — don't point it at real data.
+
+`series` is reported but never written: the model reads any prominent line on
+a cover as a series, and in practice that meant funding programs and document
+types.
+
+Writes go through the same code as `apply` — backup, `expect`, collection
+diffing — so an `enrich` write gets a backup tagged `enrich` and the same
+`collectionsLost` / `parentCollectionsGained` warnings.
 
 ## The `logs` endpoint
 
@@ -263,6 +384,46 @@ silent `{}`:
 
 A top-level `return somePromise` is awaited for you. What breaks is a promise
 *nested* in a returned object. **When in doubt, `await`.**
+
+### …and `onlyTopLevel: true` does not mean "bibliographic items"
+
+`getAll`'s top-level filter joins two tables:
+
+```js
+'SELECT A.itemID FROM items A' +
+' LEFT JOIN itemNotes B USING (itemID)' +
+' LEFT JOIN itemAttachments C ON (C.itemID=A.itemID)' +
+' WHERE B.parentItemID IS NULL AND C.parentItemID IS NULL'
+```
+
+There is **no `itemAnnotations` join**, so every highlight and underline in the
+library counts as a top-level item. Measured on a real library:
+
+| | |
+| --- | --- |
+| `(await Zotero.Items.getAll(1, true)).length` | **11 231** |
+| …of which annotations | 10 030 |
+| …standalone attachments / notes | 2 / 2 |
+| **actual bibliographic items** | **1 197** |
+
+The performance cost is the obvious half: finding the 1 197 items that matter
+means 10 030 wasted `getAttachments()` calls, and measured, that loop does not
+come back. The worse half is that **the number lies** — a tool reporting
+`itemsProbed: 11231` looks like it scanned the library while it really looked
+at a tenth of it, and wrong numbers are worse than slow ones.
+
+Filter by type:
+
+```js
+for (const it of await Zotero.Items.getAll(1, true, false, false)) {
+  if (it.isAttachment() || it.isNote() || it.isAnnotation()) continue;
+  // ...a bibliographic item
+}
+```
+
+Do not hand-write an `itemTypeID` comparison instead: `annotation`'s
+`itemTypeID` is **1**, which reads like "default / ordinary item", so a
+hand-rolled check tends to wave the annotations straight through.
 
 ## Security model
 
@@ -398,7 +559,7 @@ Zotero 10 (`no such table`) — `deletedItems` is the authoritative trash record
 ## Development
 
 ```bash
-node test_bridge.js              # 136 tests against stubbed Zotero globals
+node test_bridge.js              # 160 tests against stubbed Zotero globals
 python mutate.py                 # revert each fix, confirm the suite goes red
 python make_icon.py --preview    # icon variants sheet, writes nothing
 python build.py                  # package the xpi
@@ -480,9 +641,10 @@ Zotero 的插件 API 没有进程外通道。凡是连接器 API 覆盖不到的
 搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。常规做法是打开
 **工具 → 开发者 → Run JavaScript**，每次手动贴代码。
 
-这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了七个 HTTP
+这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了八个 HTTP
 端点，让脚本可以代劳。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
-其中能写的是 `exec` / `merge` / `apply`，只读的是 `ping` / `logs` / `query` / `doctor`。
+其中能写的是 `exec` / `merge` / `apply` / `enrich`，
+只读的是 `ping` / `logs` / `query` / `doctor`。
 
 > **安全提醒**：这些端点能在 Zotero 里执行**任意 JS**，可读写你整个库。
 > 任何能读到 token 文件的进程都能删掉你的库。这是个人自动化工具，不是加固过的
@@ -494,18 +656,28 @@ Install Add-on From File…**。装入后 token 会自动写到 `<数据目录>/
 
 ```bash
 python zoterojs.py ping
-python zoterojs.py exec "return (await Zotero.Items.getAll(1, true)).length"
+python zoterojs.py exec "return Zotero.version"
 python zoterojs.py merge 主条目KEY 重复KEY --dry-run
 python zoterojs.py logs --min-level warning
 python zoterojs.py query --title 物理化学 --limit 20
 python zoterojs.py doctor
 python zoterojs.py apply ops.json          # 不给 --yes 就是演练
+python zoterojs.py enrich --items KEY1,KEY2  # 哪些 PDF 该送去 OCR/视觉
+python zoterojs.py enrich --scan             # ……扫全库
+python zoterojs.py enrich findings.json [--yes]   # 把视觉读到的写回去
 python zoterojs.py backup
 ```
 
 **最容易踩的坑**：Zotero 10 里 `Zotero.Items.getAll` / `getDeleted` / `getAsync`
 都是 **async** 的，`get` / `getByLibraryAndKey` 是同步的。忘了 `await` 不会报错，
 只会静默返回 `{}` 或 `undefined`——序列化器现在会把这种情况显式标出来。
+
+**同一个 `getAll` 上还有第二个坑，跟 async 无关**：`onlyTopLevel: true`
+**不等于「书目条目」**——它只 join 了 `itemNotes` 和 `itemAttachments`，
+没 join `itemAnnotations`，于是一万条高亮都被算成顶层条目（本库：`getAll`
+报 **11231**，真正的书目条目是 **1197**）。**这个数不能说谎**：一个声称扫了
+全库、其实只看了十分之一的工具，会让人得出完全错误的结论。要按类型滤，
+细节见英文部分的 Gotcha 一节。
 
 `merge` 的自检判据是「**两边都有值且不同**才算冲突」，缺失不算冲突，
 否则网络首发版（天生没有卷期页）会被误判成冲突而拒绝合并。比对前会归一化
@@ -520,24 +692,34 @@ python zoterojs.py backup
 Zotero 启动读完就自己设回 `false`。设好重启，能拿到一个会话的输出。
 
 **管理面板**在 **工具 → 首选项 → JS Bridge**，改完即生效不用重启：总开关
-（关掉后七个端点全 `503`）、只读模式（`exec`/`merge`/`apply` 返 `403`，读的口子照开）、
-七个端点各自的开关（关掉返 `404`）、响应上限（默认 1.5 MB）、备份开关与保留份数、
+（关掉后八个端点全 `503`）、只读模式（`exec`/`merge`/`apply`/`enrich` 返 `403`，
+读的口子照开）、八个端点各自的开关（关掉返 `404`）、响应上限（默认 1.5 MB）、备份开关与保留份数、
 以及 token 的复制 / 重新生成 / 重写文件，外带**立即备份**和自检两个按钮。
 两个容易误解的地方：**只读模式是拒绝服务不是沙箱**——它不解析你的代码，
 而是把写入口整个关掉；**总开关是在请求路径上拦，不是不注册端点**，
 停用后面板还在——不然关掉之后就再没有地方打开了。
 
-**三个新端点的分工**：`query` 让你**不用写 SQL** 就能查（条件名和算符都现查
+**后来几个端点的分工**：`query` 让你**不用写 SQL** 就能查（条件名和算符都现查
 `Zotero.SearchConditions`，不认识就报 400 并列出可选项，不猜）；
 `doctor` 一次跑完七项只读体检，**默认不联网**（`sync` 要连 zotero.org，得点名要）；
 `apply` 批量改元数据，**默认演练**，每条 op 可带 `expect` 前置断言，
 并且**自动报出集合归属差分**——因为把条目挂成子条目会**静默摘掉它的集合**。
-`query` 吐出的 `key` 可以直接喂给 `merge` / `apply`，三个端点串成
+`query` 吐出的 `key` 可以直接喂给 `merge` / `apply`，几个端点串成
 查询 → 演练 → 确认 → 写一条管道。
+
+**`enrich`** 是这条管道的最后一站，专治**翻译器永远认不出来的那批**：
+没有文本层的扫描件。它的判据不看 `getIndexedState`（实测有 29.7 万字符却仍是
+`PARTIAL` 的正常书），而是看 `PDFWorker.getFullText` 抽出来的字符数。
+它只做两件事——**找出候选**（只读），和**把视觉读到的写回去**（默认演练）；
+写回只有一条规矩：**只填空字段，永不覆盖**，两边都有值且不同就报成 `conflict`
+留给人判。三道闸挡在前面（见过封面/书名页/版权页、书名对得上、字段配得上这个
+条目类型），每一道都是用一次真实的错误换来的；`series` 只列不写。
+**渲染和视觉调用不在这里**——那是外部脚本的事，本插件只负责"找谁需要"和
+"按规矩写回"。详见英文部分的 [The `enrich` endpoint](#the-enrich-endpoint)。
 
 **备份**用 SQLite 的 `VACUUM INTO` 出一份干净单文件副本（不动正在用的库，
 目标已存在则拒写），按份数自动轮转。开了「写操作前自动备份」之后，
-merge / apply 会先备一份，**备份失败就中止这次写**——兜不住还照写等于这个开关白开。
+merge / apply / enrich 会先备一份，**备份失败就中止这次写**——兜不住还照写等于这个开关白开。
 
 ## License
 

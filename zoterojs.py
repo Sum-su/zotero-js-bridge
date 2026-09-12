@@ -10,6 +10,8 @@
     zjs.doctor()                                # 一键库体检，全部只读
     zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)
     zjs.apply([{"item": "ABCD1234", "set": {"date": "2021"}}])   # 默认只演练
+    zjs.enrich(scan=True)                                     # 谁需要视觉补全（只读）
+    zjs.enrich(findings=[...])                                # 把视觉读到的写回去
     zjs.backup()
 
 命令行：
@@ -25,6 +27,10 @@
                              [--limit N] [--no-collections]
     python zoterojs.py doctor [CHECK ...] [--all] [--days N]
     python zoterojs.py apply ops.json [--yes] [--keep-going]
+    python zoterojs.py enrich [--items KEY,KEY] [--scan] [--include-indexed]
+                             [--missing-only/--all-items] [--min-chars N]
+                             [--limit N] [--offset N]
+    python zoterojs.py enrich findings.json [--yes] [--keep-going] [--loose]
     python zoterojs.py backup
 """
 
@@ -362,6 +368,71 @@ def apply(ops, dry_run: bool = True, stop_on_error: bool = True,
                  timeout=timeout)
 
 
+def enrich(findings=None, items=None, scan: bool = False, dry_run: bool = True,
+           strict: bool = True, stop_on_error: bool = True, missing_only=None,
+           min_chars: int = None, include_indexed: bool = False,
+           limit: int = None, offset: int = None, timeout: int = 300) -> dict:
+    """扫描件补全。**两种用法，同一个端点。**
+
+    **A. 找候选（只读）** —— 不给 findings 时走这条：
+
+        zjs.enrich(items=["ABCD1234"])   # 点名查这几个条目（快，毫秒级/条）
+        zjs.enrich(scan=True)            # 全库扫（慢，见下）
+
+    返回的 page 里是「PDF 抽不出文本」的附件，一条一条带真实文件路径 ——
+    拿去渲染前几页、喂给视觉模型。判据是 `Zotero.PDFWorker.getFullText` 的字符数，
+    **不是** `Zotero.Fulltext.getIndexedState`：后者把「正常书里有一页没字」
+    （实测 23NZF8PY 10.0 万字符 / 27RCEEVC 29.7 万字符）和「整本扫描件」都叫 PARTIAL。
+    实测 1235 个 PDF：getFullText 每本约 337 ms，所以全库扫要 7 分钟左右；
+    scan=True 会先用 getIndexedState 粗筛掉已有索引的（1235 → 200），约 67 秒。
+    include_indexed=True 连粗筛也跳过（基本只有调试用得上）。
+
+    missing_only 默认 True：字段已经齐的条目直接跳过，视觉没得补 ——
+    省下的是**渲染 + 模型调用**，那才是大头。要连它们一起看就 missing_only=False。
+
+    **B. 写回（可写）** —— 给了 findings 时走这条：
+
+        zjs.enrich(findings=[{"item": "ABCD1234", "pages": [{"p": 1, "type": "封面"}],
+                              "title": "…", "publisher": "…", "year": "2019",
+                              "authors": ["张三"], "evidence": "封面上那一行原文"}])
+
+    findings 是视觉读出来的东西，每条一个条目。**只补库里为空的字段，绝不覆盖** ——
+    两边都有值且不同的一律进 conflict，只报不写；要覆盖是 apply 的活。
+    **默认 dry_run=True**，返回的 report 里逐字段给 from / to / kind。
+
+    strict=True（默认）过三道闸，任一不过就整条挂起（进 gatedReport，不写）：
+      ① 见过前置页（封面 / 书名页 / 扉页 / 版权页 / CIP / 题名页）
+      ② 抽出来的书名与条目标题对得上（归一化后互为子串）
+      ③ 期刊论文身上不许出现 ISBN / 出版社 / 版次 / 丛书
+    这三道闸是真机踩出来的，不是理论洁癖：82L9PCBI 的「出版社 + ISBN」读的是它
+    参考文献里那本书的那一行，② 拦不住（文章标题里确实含那个书名），只有 ③ 拦得住；
+    H2GCDM5B 的出版社是从前言一句致谢里抠的（"感谢清华大学出版社…"），只有 ① 拦得住。
+    strict=False 是**反面证明**用的（关掉闸门同一条就该能过），别拿去跑真数据。
+
+    series 字段只列不写（kind="review"）：模型把资助项目、文献类型都当成了丛书。
+
+    写路径复用 apply 那套 —— 备份、expect、集合差分都在那边，不另起一套。
+    """
+    if findings is not None:
+        return _post("/zoterojs/enrich", {
+            "findings": list(findings), "dryRun": dry_run,
+            "strict": strict, "stopOnError": stop_on_error,
+        }, timeout=timeout)
+    # items 要送成**真数组**：端点那边的 asKeyList **不按逗号拆**（非数组一律包成
+    # 单元素数组），所以 "ABC,DEF" 这种字符串会被当成**一个** key ——
+    # 表现是"条目不存在"，而不是报参数错。这里统一拆好，_get 会把它 JSON 出去。
+    if isinstance(items, str):
+        items = _split(items)
+    params = {
+        "items": list(items) if items else None,
+        "scan": "true" if scan else None,
+        "includeIndexed": "true" if include_indexed else None,
+        "minChars": min_chars, "limit": limit, "offset": offset,
+        "missingOnly": None if missing_only is None else ("true" if missing_only else "false"),
+    }
+    return _get("/zoterojs/enrich", params, timeout=timeout)
+
+
 def backup(timeout: int = 600) -> dict:
     """立刻备份整个库（VACUUM INTO，写一份干净的单文件副本，不动正在用的库）。
 
@@ -423,6 +494,39 @@ def _parse_flags(args, value_flags, bool_flags):
             continue
         return {}, f"未知参数: {a}"
     return kw, None
+
+
+_APPLY_MARK = {"applied": "改", "would-change": "会改", "no-change": "不动",
+               "skipped": "跳过", "error": "出错"}
+
+
+def _print_apply_report(res):
+    """apply / enrich 共用的写入报告。两边各印一遍迟早会分叉，
+    而分叉的那一边多半会漏掉集合差分那几条警告。"""
+    if res.get("backup"):
+        print(f"[已自动备份] {res['backup']['path']}", file=sys.stderr)
+    for r in res["report"]:
+        mark = _APPLY_MARK.get(r["status"], r["status"])
+        print(f"{mark:4} {r['item']}")
+        for c in (r.get("changes") or []):
+            print(f"       {c.get('field')}: {c.get('from', '')!r} → {c.get('to', '')!r}")
+        if r.get("why"):
+            print(f"       ⚠ {r['why']}")
+        for cid in (r.get("collectionsLost") or []):
+            print(f"       ⚠ 丢了集合 {cid}（挂父级会静默摘掉，用 addToCollection 补回去）")
+        # 挂父级的第二重副作用，落在**另一个条目**上 —— 2026-09-12 踩到才知道要让差分盯着它
+        if r.get("wouldGiveParent"):
+            print(f"       ⚠ 演练：挂上去之后，{r.get('parentItem')} 会拿到集合 "
+                  f"{r['wouldGiveParent']}")
+        for cid in (r.get("parentCollectionsGained") or []):
+            print(f"       ⚠ 父条目 {r.get('parentItem')} 被塞进了集合 {cid}"
+                  f"（父子条目原有归属转过去的，用 removeFromCollection 摘掉）")
+            print(f"         父条目集合 {r.get('parentCollectionsBefore')} → "
+                  f"{r.get('parentCollectionsAfter')}")
+    print(f"\n改 {res['applied']} · 跳过 {res['skipped']} · 出错 {res['errors']}"
+          + ("（演练，未写入；确认后加 --yes）" if res["dryRun"] else ""), file=sys.stderr)
+    if res.get("warning"):
+        print(res["warning"], file=sys.stderr)
 
 
 def _main(argv):
@@ -549,31 +653,73 @@ def _main(argv):
             ops = ops.get("ops", ops)
         res = apply(ops, dry_run="--yes" not in argv,
                     stop_on_error="--keep-going" not in argv)
-        if res.get("backup"):
-            print(f"[已自动备份] {res['backup']['path']}", file=sys.stderr)
-        for r in res["report"]:
-            mark = {"applied": "改", "would-change": "会改", "no-change": "不动",
-                    "skipped": "跳过", "error": "出错"}.get(r["status"], r["status"])
-            print(f"{mark:4} {r['item']}")
-            for c in (r.get("changes") or []):
-                print(f"       {c.get('field')}: {c.get('from', '')!r} → {c.get('to', '')!r}")
-            if r.get("why"):
-                print(f"       ⚠ {r['why']}")
-            for cid in (r.get("collectionsLost") or []):
-                print(f"       ⚠ 丢了集合 {cid}（挂父级会静默摘掉，用 addToCollection 补回去）")
-            # 挂父级的第二重副作用，落在**另一个条目**上 —— 2026-09-12 踩到才知道要让差分盯着它
-            if r.get("wouldGiveParent"):
-                print(f"       ⚠ 演练：挂上去之后，{r.get('parentItem')} 会拿到集合 "
-                      f"{r['wouldGiveParent']}")
-            for cid in (r.get("parentCollectionsGained") or []):
-                print(f"       ⚠ 父条目 {r.get('parentItem')} 被塞进了集合 {cid}"
-                      f"（父子条目原有归属转过去的，用 removeFromCollection 摘掉）")
-                print(f"         父条目集合 {r.get('parentCollectionsBefore')} → "
-                      f"{r.get('parentCollectionsAfter')}")
-        print(f"\n改 {res['applied']} · 跳过 {res['skipped']} · 出错 {res['errors']}"
-              + ("（演练，未写入；确认后加 --yes）" if res["dryRun"] else ""), file=sys.stderr)
-        if res.get("warning"):
-            print(res["warning"], file=sys.stderr)
+        _print_apply_report(res)
+    elif cmd == "enrich":
+        rest = argv[2:]
+        # argv[2] 是文件路径就是写回模式，否则是找候选 —— 跟端点的两条路一一对应。
+        # 判据只看**第一个**参数：写回模式没有别的定位参数，不会跟标志位打架。
+        if rest and not rest[0].startswith("--"):
+            with open(rest[0], encoding="utf-8") as f:
+                findings = json.load(f)
+            if isinstance(findings, dict):
+                findings = findings.get("findings", findings)
+            bad = [a for a in rest[1:]
+                   if a not in ("--yes", "--keep-going", "--loose")]
+            if bad:
+                print(f"未知参数: {', '.join(bad)}", file=sys.stderr)
+                return 1
+            res = enrich(findings=findings, dry_run="--yes" not in rest,
+                         stop_on_error="--keep-going" not in rest,
+                         strict="--loose" not in rest)
+            for g in res.get("gatedReport") or []:
+                print(f"挂起 {g['item']}  {(g.get('title') or '')[:40]}", file=sys.stderr)
+                for w in g.get("why") or []:
+                    print(f"       ⚠ {w}", file=sys.stderr)
+                if g.get("evidence"):
+                    print(f"       依据原文：{g['evidence']}", file=sys.stderr)
+            for e in res.get("errorReport") or []:
+                print(f"出错 {e['item']}：{e['why']}", file=sys.stderr)
+            # 冲突要**逐条点名**：这是唯一得由人来判的一类，汇总成个数等于没报
+            for c in res.get("report") or []:
+                for r in c["fields"]:
+                    if r["kind"] == "conflict":
+                        print(f"⚠ 冲突 {c['item']} {r['field']}："
+                              f"库里 {r.get('from')!r} ／ 读出 {r.get('to')!r}", file=sys.stderr)
+            t = res.get("tally") or {}
+            print(f"\n读 {res['findings']} 条 · 过闸 {res['checked']} · 挂起 {res['gated']} · "
+                  f"补空 {t.get('new', 0)} · 补全 {t.get('extend', 0)} · "
+                  f"一致 {t.get('same', 0)} · 冲突 {t.get('conflict', 0)}（不写）· "
+                  f"待核 {t.get('review', 0)}（series，不写）", file=sys.stderr)
+            _print_apply_report(res["apply"])
+        else:
+            kw, err = _parse_flags(rest, {
+                "--items": ("items", _split), "--min-chars": ("min_chars", int),
+                "--limit": ("limit", int), "--offset": ("offset", int),
+            }, {"--scan": ("scan", True), "--include-indexed": ("include_indexed", True),
+                "--missing-only": ("missing_only", True),
+                "--all-items": ("missing_only", False)})
+            if err:
+                print(f"{err}\n用法: python zoterojs.py enrich "
+                      f"[--items KEY,KEY] [--scan] [--include-indexed] [--all-items] "
+                      f"[--min-chars N] [--limit N] [--offset N]", file=sys.stderr)
+                return 1
+            res = enrich(**kw)
+            print(f"扫了 {res['itemsProbed']} 个条目 / {res['attsProbed']} 个附件"
+                  + (f" · 粗筛跳过 {res['skippedIndexed']} 个已有索引的"
+                     if res.get("skippedIndexed") else "")
+                  + f" · 候选 {res['candidates']} 条", file=sys.stderr)
+            for e in res.get("errorReport") or []:
+                print(f"出错 {e['item']}：{e['why']}", file=sys.stderr)
+            for c in res["page"]:
+                print(f"\n{c['item']}  {c['type']:14} {(c.get('title') or '')[:50]}")
+                if c.get("missing"):
+                    print(f"   缺：{'、'.join(c['missing'])}")
+                for a in c["atts"]:
+                    note = f"抽不出（{a['error']}）" if a.get("error") else f"{a['chars']} 字符"
+                    print(f"   {a['akey']}  {note:16} {a['file']}")
+            if res.get("truncated"):
+                print(f"\n还有更多（候选 {res['candidates']} 条只显示了 "
+                      f"{len(res['page'])} 条），用 --limit / --offset 翻页", file=sys.stderr)
     elif cmd == "backup":
         res = backup()
         print(f"已备份 {(res['bytes'] / 1048576):.1f} MB · {res['ms']} ms")

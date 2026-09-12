@@ -1,6 +1,6 @@
 /* Zotero JS Bridge
  *
- * 在 Zotero 自带的 127.0.0.1 HTTP 服务器（默认 23119）上挂七个端点：
+ * 在 Zotero 自带的 127.0.0.1 HTTP 服务器（默认 23119）上挂八个端点：
  *
  *   GET       /zoterojs/ping    健康检查，不需要 token
  *   POST      /zoterojs/exec    执行任意 JS（支持顶层 await / return），需要 token
@@ -9,6 +9,7 @@
  *   GET|POST  /zoterojs/query   结构化只读查询（不用写 SQL），需要 token
  *   GET|POST  /zoterojs/doctor  库体检：孤儿目录、未归类、附件标题、重名附件…需要 token
  *   POST      /zoterojs/apply   批量写（支持 dryRun）+ 集合归属前后差分，需要 token
+ *   GET|POST  /zoterojs/enrich  扫描件补全：找没文本层的 PDF / 写回视觉读到的，需要 token
  *
  * Token 首次启动生成并记在 pref 里，每次启动都写入 Zotero 数据目录下的
  * zoterojs-token.txt，外部程序读这个文件即可。
@@ -30,10 +31,11 @@ const PREF_READONLY = "jsbridge.readonly";
 const PREF_RESPONSE_KB = "jsbridge.limit.responseKB";
 const PREF_BACKUP = "jsbridge.backup.enabled";
 const PREF_BACKUP_KEEP = "jsbridge.backup.keep";
+const PREF_ENRICH_MIN = "jsbridge.enrich.minChars";
 const TOKEN_FILE = "zoterojs-token.txt";
 const BACKUP_DIR = "jsbridge-backups";
 const PATHS = ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs",
-  "/zoterojs/query", "/zoterojs/doctor", "/zoterojs/apply"];
+  "/zoterojs/query", "/zoterojs/doctor", "/zoterojs/apply", "/zoterojs/enrich"];
 
 /* 每个端点一个开关。面板上勾掉哪个，哪个当场返回 404 —— 闸门在请求路径上现读 pref，
  * 所以改完立刻生效，既不用重启也不用重新注册端点。 */
@@ -45,6 +47,7 @@ const PREF_EP = {
   "/zoterojs/query": "jsbridge.endpoint.query",
   "/zoterojs/doctor": "jsbridge.endpoint.doctor",
   "/zoterojs/apply": "jsbridge.endpoint.apply",
+  "/zoterojs/enrich": "jsbridge.endpoint.enrich",
 };
 
 /* 读 pref 的三条规矩（都踩过）：
@@ -1205,7 +1208,9 @@ async function doApply(p) {
   const stoppedOnError = p.stopOnError === undefined ? true : asBool(p.stopOnError);
 
   let backup = null;
-  if (!dryRun) backup = await backupBefore("apply");
+  // tag 只影响备份文件名。enrich 复用这段写逻辑时传 "enrich"，
+  // 事后翻备份目录能一眼看出这次写是哪个端点干的。
+  if (!dryRun) backup = await backupBefore(p.tag || "apply");
 
   const report = [];
   for (const op of ops) {
@@ -1310,6 +1315,374 @@ async function doApply(p) {
       "见各条的 parentCollectionsGained —— 那多半不是你想要的，父条目自己不会退出那些集合。");
   }
   if (warns.length) out.warning = warns.join(" ");
+  return out;
+}
+
+/* ---------------- 视觉补全：外部抽出来的字段，过闸再写 ---------------- */
+
+/* 这段为什么在插件里、而不在调用方的脚本里：
+
+   2026-09-12 拿 74 个没有文本层的扫描件跑了一遍视觉提取，45 个抽出了字段，其中两次是幻觉：
+
+     · 82L9PCBI 是一篇期刊论文，正文里有参考文献页，而那一行的格式
+       （`书名/作者. —版次. 出版地：出版社，年.月`）和 CIP 行几乎一样，模型把
+       **被它引用的那本书**的出版社 / 年份 / ISBN 当成了条目自己的；
+     · H2GCDM5B 从前言里的一句致谢（"感谢清华大学出版社…"）抠出了出版社。
+
+   当场能看出这两条的只有模型自己回报的 evidence 原文；真正把它们拦下来的是
+   「期刊论文身上不该出现出版社 / ISBN」这一条 —— 而判它需要知道**条目是什么类型、
+   现值是什么**，那只有 Zotero 有。所以闸门留在这一侧：不管字段是视觉模型、别的
+   插件还是手工填的，进这个端点都得过同一道。
+
+   ⚠️ 这个端点**只补空，不覆盖**。两边都有值且不同的一律列成 conflict 挂起。
+   要改已有值就走 apply —— 那是另一个口子，得由人明确说改哪个字段。 */
+
+/* 见到这些页，抽出来的书目字段才算数。 */
+const FRONT_KINDS = ["封面", "书名页", "扉页", "版权页", "CIP", "题名页"];
+
+/* 只列不写。series 是模型明显越界的一处：它把封面上任何显眼的行都当丛书，
+   实测 23 处里混着「国家自然科学基金重大项目」（资助项目）、
+   「中华人民共和国国家标准」（文献类型）、「水利部科技专著出版基金资助项目」（基金）。
+   这个字段错了不影响检索，但会污染引文样式，不值得冒自动写的险。 */
+const REVIEW_ONLY_FIELDS = ["series"];
+
+/* 按条目类型列出「还该有、但现在空着」的字段。先知道缺什么，才知道值不值得为它跑视觉。 */
+const ENRICH_NEEDED = {
+  book: ["publisher", "date", "ISBN", "creators"],
+  bookSection: ["publisher", "date", "ISBN", "creators"],
+  conferencePaper: ["publisher", "date", "ISBN", "creators"],
+  report: ["publisher", "date", "ISBN", "creators"],
+  standard: ["publisher", "date", "ISBN", "creators"],
+  thesis: ["university", "date", "creators"],
+  journalArticle: ["publicationTitle", "date", "volume", "issue", "pages", "DOI", "creators"],
+};
+const ENRICH_NEEDED_DEFAULT = ["date", "creators"];
+
+function normForCompare(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/[\s《》〈〉:：,，.。\-—－_/·、（）()\[\]【】]/g, "").toLowerCase();
+}
+
+/* 闸一：见没见过前置页。 */
+function hasFrontMatter(f) {
+  const pages = Array.isArray(f.pages) ? f.pages : [];
+  return pages.some(p => FRONT_KINDS.some(k => String((p && p.type) || "").indexOf(k) >= 0));
+}
+
+/* 闸二：抽出的书名和条目自己的标题对得上吗。
+
+   这条比闸一更硬，因为**页类型判定本身也会错**：82L9PCBI 的参考文献页格式像 CIP 行，
+   模型把它判成了「版权页CIP」，闸一于是放行。而它抽出的书名（弹性力学简明教程）
+   和条目标题（对《弹性力学简明教程》中一处内容的商榷）根本对不上 —— 一测就露。 */
+function titleFits(item, f) {
+  const a = normForCompare(item.getField("title"));
+  const b = normForCompare(f.title);
+  if (!a || !b) return true;                    // 任一边没有标题就无从判，交给闸一
+  return a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+}
+
+/* 闸三：期刊论文身上不该出现出版社 / ISBN / 版次 / 丛书。
+
+   这是三道里唯一挡住 82L9PCBI 的：那条闸二也能过 ——
+   《对〈弹性力学简明教程〉中一处内容的商榷》里**确实**含「弹性力学简明教程」。
+   但它是期刊论文，没有 ISBN 和出版社字段，抽出来了就说明读的是被它引用的那本书。
+   只卡期刊论文：学位论文的「出版者」栏本来就放授予单位，会议论文也有出版社。 */
+const NOT_FOR_JOURNAL = ["isbn", "publisher", "edition", "series"];
+
+function fieldsFitType(item, f) {
+  if (item.itemType !== "journalArticle") return true;
+  return !NOT_FOR_JOURNAL.some(k => f[k]);
+}
+
+function gateFinding(item, f) {
+  const why = [];
+  if (!hasFrontMatter(f)) {
+    why.push("没见到前置页（封面 / 书名页 / 版权页）—— 抽出来的很可能是正文里的参考文献或致谢");
+  }
+  if (!titleFits(item, f)) why.push("抽出的书名与条目标题对不上");
+  if (!fieldsFitType(item, f)) why.push("这是期刊论文，却抽出了出版社 / ISBN —— 读的多半是被它引用的那本书");
+  return why;
+}
+
+/* 抽出来的年 / 月拼成 Zotero 认的日期。月份出了 1–12 就当没有月份。 */
+function enrichDate(year, month) {
+  const y = String(year === null || year === undefined ? "" : year).trim();
+  if (!/^\d{4}$/.test(y)) return null;
+  const m = String(month === null || month === undefined ? "" : month).trim();
+  if (/^\d{1,2}$/.test(m) && +m >= 1 && +m <= 12) return y + "-" + ("0" + (+m)).slice(-2);
+  return y;
+}
+
+/* 这个条目还缺哪些可填字段。 */
+function missingFields(item) {
+  const want = ENRICH_NEEDED[item.itemType] || ENRICH_NEEDED_DEFAULT;
+  const out = [];
+  for (const f of want) {
+    if (f === "creators") {
+      if (!item.getCreators().length) out.push("creators");
+      continue;
+    }
+    try { if (!String(item.getField(f) || "").trim()) out.push(f); }
+    catch (e) { /* 这个类型没这个字段，本来就不该列 */ }
+  }
+  return out;
+}
+
+async function pdfAttsOf(item) {
+  const out = [];
+  let ids = [];
+  try { ids = await item.getAttachments(); } catch (e) { return out; }
+  for (const id of ids) {
+    const a = Zotero.Items.get(id);
+    if (a && a.attachmentContentType === "application/pdf") out.push(a);
+  }
+  return out;
+}
+
+/* 附件的真实文件路径。getFilePathAsync 会处理链接附件和相对路径，
+   比拿 dataDir 拼 "storage/<key>/<文件名>" 靠得住 —— 那个拼法对链接附件是错的。 */
+async function filePathOf(a) {
+  try {
+    if (typeof a.getFilePathAsync === "function") {
+      const p = await a.getFilePathAsync();
+      if (p) return String(p);
+    }
+  } catch (e) { /* 文件不在本地之类，退回 storage 目录 */ }
+  try {
+    const d = Zotero.Attachments.getStorageDirectory(a);
+    if (d) {
+      const base = d.path || String(d);
+      const name = a.attachmentFilename || "";
+      if (typeof PathUtils !== "undefined" && PathUtils.join) return PathUtils.join(base, name);
+      return base + "/" + name;
+    }
+  } catch (e) { /* 真拿不到就返回空串，调用方按"没有本地文件"处理 */ }
+  return "";
+}
+
+/* 比对一条 finding，产出 {rows, op}。op 为 null 表示没有可写的东西。
+
+   规则和 apply 不同：这里**只补空**。两边都有值且不同的一律 conflict，不写。 */
+async function enrichDiff(item, f) {
+  const cand = {
+    title: f.title, publisher: f.publisher, place: f.place,
+    date: enrichDate(f.year, f.month), edition: f.edition,
+    ISBN: f.isbn, series: f.series,
+  };
+  // 学位论文没有「出版者」栏，视觉抽到的那个出版社其实是学位授予单位
+  if (item.itemType === "thesis") { cand.university = f.publisher; delete cand.publisher; }
+
+  const rows = [], set = {};
+  for (const field of Object.keys(cand)) {
+    const raw = cand[field];
+    if (raw === null || raw === undefined) continue;
+    const nv = String(raw).trim();
+    if (!nv) continue;
+
+    let old;
+    try { old = String(item.getField(field) || "").trim(); }
+    catch (e) { rows.push({ field, to: nv, kind: "nofield" }); continue; }  // 这类型没这字段
+
+    if (field === "title" && old) {
+      if (old === nv) { rows.push({ field, from: old, to: nv, kind: "same" }); continue; }
+      /* 两个标题互为前缀时是同一本书，谁更全用谁 —— 但**只认「抽出来的更全」这一边**。
+         反过来写会把已有的完整标题截短：实测库里是「从抛物线谈起：混沌动力学引论」，
+         而视觉那张扉页只印了「从抛物线谈起」，盲目跟视觉会把副标题丢掉。 */
+      if (nv.indexOf(old) === 0) {
+        rows.push({ field, from: old, to: nv, kind: "extend" });
+        set[field] = nv;
+        continue;
+      }
+      if (old.indexOf(nv) === 0) { rows.push({ field, from: old, to: nv, kind: "same" }); continue; }
+      rows.push({ field, from: old, to: nv, kind: "conflict" });
+      continue;
+    }
+
+    if (old === nv) { rows.push({ field, from: old, to: nv, kind: "same" }); continue; }
+    if (!old) {
+      if (REVIEW_ONLY_FIELDS.indexOf(field) >= 0) { rows.push({ field, to: nv, kind: "review" }); continue; }
+      rows.push({ field, to: nv, kind: "new" });
+      set[field] = nv;
+      continue;
+    }
+    rows.push({ field, from: old, to: nv, kind: "conflict" });
+  }
+
+  // 创建者只在库里一个都没有时补。字符串交给 applyOne 的 normalizeCreator 走单字段模式，
+  // 中文名才不会被 Zotero 按"首字为姓"硬拆。
+  const names = (Array.isArray(f.authors) ? f.authors : [])
+    .map(x => String(x === null || x === undefined ? "" : x).trim()).filter(Boolean);
+  const emptyCreators = !item.getCreators().length;
+  if (names.length) {
+    const cur = item.getCreators().map(creatorLine).join(" / ");
+    if (emptyCreators) rows.push({ field: "creators", to: names.join(" / "), kind: "new" });
+    else rows.push({ field: "creators", from: cur, to: names.join(" / "), kind: "same" });
+  }
+
+  const op = { item: item.key };
+  if (Object.keys(set).length) op.set = set;
+  if (names.length && emptyCreators) op.setCreators = names;
+  return { rows, op: Object.keys(op).length > 1 ? op : null };
+}
+
+async function doEnrich(p) {
+  const findings = Array.isArray(p.findings) ? p.findings : [];
+  if (!findings.length) {
+    return { error: "需要 {findings: [{item: 'KEY', pages: [{p: 1, type: '封面'}], " +
+      "title: …, publisher: …}, …]}；只想找候选就给 items= 或 scan=1" };
+  }
+  const strict = p.strict === undefined ? true : asBool(p.strict);
+  const libID = Zotero.Libraries.userLibraryID;
+
+  const ops = [], gated = [], checked = [], errors = [];
+  for (const f of findings) {
+    const key = String(f.item || f.key || "");
+    if (!key) { errors.push({ item: "", why: "findings 里有一条没给 item" }); continue; }
+    try {
+      const item = await getItem(libID, key);
+      if (!item) { errors.push({ item: key, why: "条目不存在" }); continue; }
+
+      const why = strict ? gateFinding(item, f) : [];
+      if (why.length) {
+        gated.push({ item: key, title: item.getField("title"), why,
+                     evidence: String(f.evidence || "").slice(0, 300) });
+        continue;
+      }
+      const { rows, op } = await enrichDiff(item, f);
+      checked.push({ item: key, title: item.getField("title"), fields: rows });
+      if (op) ops.push(op);
+    } catch (e) {
+      errors.push({ item: key, why: String(e.message || e) });
+    }
+  }
+
+  const tally = {};
+  for (const c of checked) for (const r of c.fields) tally[r.kind] = (tally[r.kind] || 0) + 1;
+
+  const out = {
+    ok: true, strict,
+    findings: findings.length,
+    gated: gated.length, gatedReport: gated,
+    checked: checked.length,
+    withOps: ops.length,
+    tally,
+    // 全部已过闸的条目都带回去，**不滤掉「只有 same」的** ——
+    // 滤掉的话调用方看不出"这条查过了、两边一致"，只看到它凭空消失，
+    // 于是分不清"比对过了"和"根本没处理"。
+    report: checked,
+    errors: errors.length,
+  };
+  if (errors.length) out.errorReport = errors;
+
+  /* 写走 doApply：备份、expect、集合差分都在那边，不另起一套 ——
+     两套写库逻辑迟早会分叉，而分叉的那一套不会有备份。 */
+  out.apply = ops.length
+    ? await doApply({ ops, dryRun: !!p.dryRun, stopOnError: p.stopOnError, tag: "enrich" })
+    : { ok: true, dryRun: !!p.dryRun, applied: 0, skipped: 0, errors: 0, report: [] };
+  return out;
+}
+
+/* 找出「没有文本层」的 PDF 附件 —— 也就是视觉（或 OCR）唯一帮得上忙的那批。
+
+   判据用 Zotero.PDFWorker.getFullText 抽出来的字符数，比 Zotero.Fulltext.getIndexedState
+   准得多：后者把「正常书里有一页没字」和「整本扫描件」都叫 PARTIAL。实测（2026-09-12）：
+
+     23NZF8PY  10.0 万字符 → PARTIAL   ┐ 都是正常书，只是个别页没字
+     27RCEEVC  29.7 万字符 → PARTIAL   ┘
+     2J4LLG6Q   0 字符     → UNINDEXED ┐ 同为纯扫描件，状态却判得不一样，
+     4BY9B5LC   0 字符     → PARTIAL   ┘ 所以不能拿状态当判据
+
+   ⚠️ 代价实测（1235 个 PDF）：getIndexedState 全库 198 ms，是纯 DB 读；
+   而 getFullText 每本约 337 ms，**全库要 7 分钟**。放进 HTTP 请求里太久了，
+   所以默认只处理调用方点名的条目（items=…）。全库扫要显式给 scan=1，
+   并且先拿 getIndexedState 粗筛掉已有索引的（1235 → 200），约 67 秒。 */
+async function doEnrichScan(p) {
+  const libID = Zotero.Libraries.userLibraryID;
+  const minChars = asInt(p.minChars, prefInt(PREF_ENRICH_MIN, 1000, 0, 1000000), 0, 1000000);
+  const missingOnly = p.missingOnly === undefined ? true : asBool(p.missingOnly);
+  const limit = asInt(p.limit, 100, 1, 1000);
+  const offset = asInt(p.offset, 0, 0, 1000000);
+  const wantKeys = asKeyList(asList(p.items));
+  const fullScan = asBool(p.scan);
+
+  let items = [];
+  if (wantKeys.length) {
+    for (const k of wantKeys) {
+      const it = await getItem(libID, k);
+      if (it) items.push(it);
+      else if (!fullScan) items.push(null);      // 占位，下面报出来
+    }
+  } else if (fullScan) {
+    /* onlyTopLevel=true 只挡掉「有父条目的」笔记和附件。**要注意两个坑：**
+
+       ① 独立笔记 / 独立附件本身是顶层，自己不是书目条目 —— 下面一并滤掉。
+       ② ⚠️ getAll 只 LEFT JOIN 了 itemNotes 和 itemAttachments，
+          **没 join itemAnnotations** —— 于是 10030 条高亮批注全被当成顶层条目
+          （实测：getAll(lib,true)=11231，其中 annotation 10030、独立附件 2、
+          独立笔记 2，真正的书目条目只有 1197）。
+          不滤掉的话，每条批注都要白跑一次 getAttachments()，实测那一步
+          直接超时；而 itemsProbed 还会报 11231，看着像"扫了一万多个条目"，
+          其实真正查过的只有一千出头 —— 数字骗人比慢更糟。 */
+    const ids = await Zotero.Items.getAll(libID, true, false, true);
+    for (const id of ids) {
+      const it = Zotero.Items.get(id);
+      if (!it) continue;
+      if (it.isAttachment() || it.isNote()) continue;
+      if (typeof it.isAnnotation === "function" && it.isAnnotation()) continue;
+      items.push(it);
+    }
+  } else {
+    return { error: "要么给 items=KEY1,KEY2 点名（快），要么给 scan=1 扫全库（慢，见端点注释）" };
+  }
+
+  const candidates = [], missingKeys = [];
+  let attsProbed = 0, skippedIndexed = 0;
+  for (const it of items) {
+    if (!it) { missingKeys.push("(不存在的条目)"); continue; }
+    const atts = await pdfAttsOf(it);
+    if (!atts.length) continue;
+    const miss = missingOnly ? missingFields(it) : [];
+    if (missingOnly && !miss.length) continue;      // 字段齐了，视觉没得补
+
+    const rows = [];
+    for (const a of atts) {
+      attsProbed++;
+      let state = null;
+      try { state = await Zotero.Fulltext.getIndexedState(a); } catch (e) { /* 拿不到就当未知 */ }
+      // 粗筛只在全库扫时用：已经有索引的附件不可能需要视觉，跳过能省掉大头的时间。
+      // 点名查的时候不跳 —— 点名就是想看这个附件的真实情况。
+      if (fullScan && !wantKeys.length && state === Zotero.Fulltext.INDEX_STATE_INDEXED
+          && !asBool(p.includeIndexed)) {
+        skippedIndexed++;
+        continue;
+      }
+      let chars = null, err = null;
+      try {
+        const t = await Zotero.PDFWorker.getFullText(a.itemID);
+        chars = String((t && t.text) || "").length;
+      } catch (e) { err = String(e.message || e); }
+      if (chars !== null && chars >= minChars) continue;   // 有文本层，视觉用不上
+      const row = {
+        akey: a.key, file: await filePathOf(a), chars, state,
+        filename: a.attachmentFilename || "",
+      };
+      if (err) row.error = err;
+      rows.push(row);
+    }
+    if (rows.length) {
+      candidates.push({ item: it.key, type: it.itemType, title: it.getField("title"),
+                        missing: miss, atts: rows });
+    }
+  }
+
+  const out = {
+    ok: true, minChars, missingOnly,
+    itemsProbed: items.length, attsProbed, skippedIndexed,
+    candidates: candidates.length, offset, limit,
+    page: candidates.slice(offset, offset + limit),
+    truncated: candidates.length > offset + limit,
+  };
+  if (missingKeys.length) out.errorReport = missingKeys.map(k => ({ item: k, why: "条目不存在" }));
   return out;
 }
 
@@ -1579,6 +1952,27 @@ const EP_APPLY = Ctor({
   },
 });
 
+const EP_ENRICH = Ctor({
+  supportedMethods: ["GET", "POST"],
+  supportedDataTypes: ["application/json"],
+  init: async function (options) {
+    /* 按**写**过闸，而且 GET 也按写算，两个理由：
+       一是 POST 确实会写库；二是 GET 的 scan 模式要抽几百个附件的全文、耗时以分钟计，
+       而只读模式 / 关掉这个端点的人，本来就不该让这个入口通着。 */
+    const bad = checkAuth(options) || gate("/zoterojs/enrich", true);
+    if (bad) return bad;
+    try {
+      const p = readParams(options);
+      // 带 findings 就是「我有抽好的字段，帮我过闸写进去」；否则是「帮我找候选」。
+      const out = Array.isArray(p.findings) ? await doEnrich(p) : await doEnrichScan(p);
+      if (out.error) return jsonReply(400, { ok: false, error: out.error });
+      return pack(out);
+    } catch (e) {
+      return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
+    }
+  },
+});
+
 const EP_LOGS = Ctor({
   supportedMethods: ["GET", "POST"],
   supportedDataTypes: ["application/json"],
@@ -1649,6 +2043,7 @@ async function startup({ id, version, resourceURI, rootURI }, reason) {
     "/zoterojs/query": EP_QUERY,
     "/zoterojs/doctor": EP_DOCTOR,
     "/zoterojs/apply": EP_APPLY,
+    "/zoterojs/enrich": EP_ENRICH,
   };
   for (const path of Object.keys(epTable)) {
     const existing = Zotero.Server.Endpoints[path];

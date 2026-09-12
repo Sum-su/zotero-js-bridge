@@ -43,7 +43,10 @@
       <checkbox id="jsb-ep-apply" native="true"
                 preference="extensions.zotero.jsbridge.endpoint.apply"
                 label="apply —— 批量改元数据（可写，自动报集合差分）"/>
-      <label>关掉的端点会返回 404，并且在 ping 的 disabled 字段里列出来。只读模式下 exec / merge / apply 回 403。</label>
+      <checkbox id="jsb-ep-enrich" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.enrich"
+                label="enrich —— 扫描件补全（可写，只补空且过三道闸）"/>
+      <label>关掉的端点会返回 404，并且在 ping 的 disabled 字段里列出来。只读模式下 exec / merge / apply / enrich 回 403。</label>
     </groupbox>
   </vbox>
 
