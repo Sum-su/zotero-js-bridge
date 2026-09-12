@@ -50,10 +50,16 @@ def bump() -> str:
     p = os.path.join(SRC, "manifest.json")
     with open(p, "r", encoding="utf-8") as fh:
         raw = fh.read()
-    m = re.search(r'"version"\s*:\s*"(\d+)\.(\d+)\.(\d+)"', raw)
+    # 版本号从 2026-09-12 起是**十进制两段**：1.12 → 1.13 → … → 1.19 → 1.20
+    # （第二位是计数位，进位写成 1.20，不写 1.2 —— 这样它当小数读也是递增的，
+    # 逐段比较也是递增的）。老的三段编号（1.0.11）在这里会被挡下：那一步是**改制**
+    # 不是递增，只能手改 manifest —— 顺手 bump 出个 1.0.12 就把约定破了，
+    # 而它看着完全正常，所以宁可在这里报错。
+    m = re.search(r'"version"\s*:\s*"(\d+)\.(\d+)"', raw)
     if not m:
-        sys.exit("manifest 里找不到 x.y.z 形式的 version")
-    new = f"{m.group(1)}.{m.group(2)}.{int(m.group(3)) + 1}"
+        sys.exit('manifest 里的 version 不是两段十进制（形如 "1.12"）；'
+                 "改制那一步要手动改，理由见本函数注释")
+    new = f"{m.group(1)}.{int(m.group(2)) + 1}"
     # newline="\n"：Windows 上文本模式会把 \n 写成 \r\n，每次 bump 都把整个文件翻成 CRLF
     with open(p, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(raw[:m.start()] + f'"version": "{new}"' + raw[m.end():])
