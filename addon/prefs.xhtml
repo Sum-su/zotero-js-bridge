@@ -1,0 +1,84 @@
+<!-- Zotero JS Bridge 管理面板。
+     这是一个 XHTML 片段（不是完整文档）：XUL 是默认命名空间，HTML 标签要写 html: 前缀。
+     控件上的 preference="..." 由 Zotero 自己的首选项代码绑定读写，不需要写 JS；
+     只有按钮要调东西，走挂在 Zotero.JSBridge 上、由 bootstrap.js 提供的那几个函数。 -->
+<vbox id="zoterojs-bridge-pane"
+      onload="Zotero.JSBridge &amp;&amp; Zotero.JSBridge.refreshTokenView(document)">
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>Zotero JS Bridge</html:h2></label>
+      <label>在 Zotero 进程内执行 JS 的本地端点。下面的开关<html:b>改完立刻生效</html:b>，不用重启 Zotero。</label>
+      <checkbox id="jsb-enabled" native="true"
+                preference="extensions.zotero.jsbridge.enabled"
+                label="启用 JS Bridge（总开关，关掉后四个端点全部停用）"/>
+      <checkbox id="jsb-readonly" native="true"
+                preference="extensions.zotero.jsbridge.readonly"
+                label="只读模式（拒绝 exec / merge，以及 logs 的 clear）"/>
+      <label>只读模式不是沙箱，是拒绝服务：exec 能写出多少种副作用静态判不全，所以它不解析你的代码，而是把写入口整个关掉。读的口子（ping / logs）留着。</label>
+    </groupbox>
+  </vbox>
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>端点</html:h2></label>
+      <checkbox id="jsb-ep-ping" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.ping"
+                label="ping —— 健康检查（不需要 token）"/>
+      <checkbox id="jsb-ep-exec" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.exec"
+                label="exec —— 执行 JS（可写）"/>
+      <checkbox id="jsb-ep-merge" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.merge"
+                label="merge —— 带自检的条目合并（可写）"/>
+      <checkbox id="jsb-ep-logs" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.logs"
+                label="logs —— 读错误控制台 / 调试输出"/>
+      <label>关掉的端点会返回 404，并且在 ping 的 disabled 字段里列出来。</label>
+    </groupbox>
+  </vbox>
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>访问令牌</html:h2></label>
+      <label>任何能读到 token 的进程都能读写甚至删掉整个库。换 token 后，所有调用方都要同步更新。</label>
+      <hbox align="center">
+        <html:input id="jsb-token" type="text" readonly="readonly" dir="ltr" style="flex: 1;"/>
+      </hbox>
+      <hbox>
+        <button id="jsb-copy" label="复制"
+                oncommand="Zotero.JSBridge.copyToken(document)"/>
+        <button id="jsb-regen" label="重新生成"
+                oncommand="Zotero.JSBridge.regenerateToken(document)"/>
+        <button id="jsb-rewrite" label="重写 token 文件"
+                oncommand="Zotero.JSBridge.rewriteTokenFile(document)"/>
+      </hbox>
+      <label>token 会镜像到数据目录下的 zoterojs-token.txt，命令行客户端读的就是它。</label>
+    </groupbox>
+  </vbox>
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>自检</html:h2></label>
+      <label>检查端点是否注册、开关状态、token 文件在不在。它不发 HTTP 请求 —— 从 Zotero 内部发请求会被它自己的 CSRF 防护掐断，测出来的失败说明不了任何问题。</label>
+      <hbox>
+        <button id="jsb-check" label="检查注册状态"
+                oncommand="Zotero.JSBridge.selfCheck(document)"/>
+      </hbox>
+      <label id="jsb-status" style="white-space: pre-wrap; font-family: monospace;">（尚未检查）</label>
+    </groupbox>
+  </vbox>
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>响应上限</html:h2></label>
+      <label>单次响应超过这个大小就截断（保留 logs 尾部）。exec 吐一大片数据时，卡住的是调用方，不是 Zotero。</label>
+      <hbox align="center">
+        <html:input id="jsb-response-kb" type="text" size="6" dir="ltr"
+                    preference="extensions.zotero.jsbridge.limit.responseKB"/>
+        <label>KB（10 – 20000）</label>
+      </hbox>
+    </groupbox>
+  </vbox>
+
+</vbox>

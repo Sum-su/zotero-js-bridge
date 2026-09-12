@@ -131,6 +131,26 @@ def token() -> str:
     )
 
 
+def _http_error(e: "urllib.error.HTTPError") -> ZoteroJSError:
+    """把端点的错误响应说成人话。
+
+    503 / 404 / 403 现在多半不是「出错了」，而是**用户自己在面板上关出来的**
+    （总开关 / 端点开关 / 只读模式）。响应体里带着 error 和 pref，
+    就摘出来给用户看，别丢一坨 JSON 过去。
+    """
+    raw = e.read().decode("utf-8", "replace")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return ZoteroJSError(f"HTTP {e.code}: {raw}")
+    if not isinstance(body, dict):
+        return ZoteroJSError(f"HTTP {e.code}: {raw}")
+    msg = body.get("error") or raw
+    pref = body.get("pref")
+    hint = f"\n（面板：工具 → 首选项 → JS Bridge；相关 pref：{pref}）" if pref else ""
+    return ZoteroJSError(f"HTTP {e.code}: {msg}{hint}")
+
+
 def _post(path: str, payload: dict, auth: bool = True, timeout: int = 300) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(BASE + path, data=body, method="POST")
@@ -143,8 +163,7 @@ def _post(path: str, payload: dict, auth: bool = True, timeout: int = 300) -> di
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
-        raise ZoteroJSError(f"HTTP {e.code}: {raw}") from None
+        raise _http_error(e) from None
     except urllib.error.URLError as e:
         raise ZoteroJSError(
             f"连不上 {BASE}{path}：{e.reason}\nZotero 开着吗？插件装了吗？"
@@ -159,8 +178,7 @@ def ping() -> dict:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
-        raise ZoteroJSError(f"HTTP {e.code}: {raw}") from None
+        raise _http_error(e) from None
     except urllib.error.URLError as e:
         raise ZoteroJSError(
             f"连不上 {BASE}/zoterojs/ping：{e.reason}\n"
@@ -299,4 +317,10 @@ def _main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(_main(sys.argv))
+    # ZoteroJSError 是我们自己抛的、给用户看的话（token 找不到、端点在面板里被关了……），
+    # 直接打出来就行，不需要一串 traceback。其它异常照旧往上抛，免得把真 bug 藏起来。
+    try:
+        sys.exit(_main(sys.argv))
+    except ZoteroJSError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        sys.exit(2)

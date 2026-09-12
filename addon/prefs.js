@@ -1,2 +1,8 @@
 pref("extensions.zotero.jsbridge.token", "");
 pref("extensions.zotero.jsbridge.enabled", true);
+pref("extensions.zotero.jsbridge.readonly", false);
+pref("extensions.zotero.jsbridge.endpoint.ping", true);
+pref("extensions.zotero.jsbridge.endpoint.exec", true);
+pref("extensions.zotero.jsbridge.endpoint.merge", true);
+pref("extensions.zotero.jsbridge.endpoint.logs", true);
+pref("extensions.zotero.jsbridge.limit.responseKB", 1500);

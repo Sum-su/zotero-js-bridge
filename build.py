@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +23,9 @@ SRC = os.path.join(HERE, "addon")
 OUT = os.path.join(HERE, "zotero-js-bridge.xpi")
 
 # 打进包里的东西。icons/ 下只收 favicon*，别把预览图捎进去。
-FIXED = ["manifest.json", "bootstrap.js", "prefs.js"]
+# prefs.js 是默认值文件，prefs.xhtml 是管理面板 —— 两个都要在，少一个都是静默出问题：
+# 少了 prefs.js 面板上的开关没有默认值，少了 prefs.xhtml 面板整块是空的。
+FIXED = ["manifest.json", "bootstrap.js", "prefs.js", "prefs.xhtml"]
 
 # Windows 控制台默认 GBK，中文输出会变成乱码，和 zoterojs.py 一样强制 UTF-8
 for _s in (sys.stdout, sys.stderr):
@@ -124,6 +127,20 @@ def main():
         if rel not in names:
             sys.exit(f"manifest 声明了 {rel}，但没被打进包")
 
+    # 面板里每一个 preference="..." 都要在 prefs.js 里有默认值，否则那个开关
+    # 一装上就是 undefined —— 界面看着正常，点一下才有问题。顺手在这里挡住。
+    pane = os.path.join(SRC, "prefs.xhtml")
+    if os.path.exists(pane):
+        with open(pane, encoding="utf-8") as fh:
+            # 先剥掉 XML 注释：注释里那句 preference="..." 是说明文字，不是绑定
+            wanted = set(re.findall(r'preference="([^"]+)"',
+                                    re.sub(r"<!--[\s\S]*?-->", "", fh.read())))
+        with open(os.path.join(SRC, "prefs.js"), encoding="utf-8") as fh:
+            declared = set(re.findall(r'pref\("([^"]+)"', fh.read()))
+        undeclared = sorted(wanted - declared)
+        if undeclared:
+            sys.exit("面板用到但 prefs.js 没给默认值的 pref: " + ", ".join(undeclared))
+
     if os.path.exists(OUT):
         os.remove(OUT)
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
@@ -152,7 +169,29 @@ return { ok: true, state: inst.state, error: inst.error, version: inst.addon?.ve
 """ % json.dumps(OUT)
 
         print("\n安装:", zoterojs.execv(code))
-        print("重启 Zotero 后生效。")
+
+        # 这里原来写的是「重启 Zotero 后生效」，是错的：引导式插件的安装会让旧实例
+        # shutdown、新实例 startup，就地热重载（v1.0.6 → 1.0.7 实测）。
+        # 但别把「不用重启」也拍成一句写死的话 —— 拿 ping 问一下真的在跑哪个版本。
+        #
+        # ping 要重试：install() 一返回**不代表新实例已经起来了**，它是在旧实例
+        # shutdown、新实例 startup 走完之前就 resolve 的。实测紧接着 ping 会拿到
+        # 404 No endpoint found，一两秒后就好了 —— 一次竞态不该报成安装失败。
+        live, err = None, None
+        for _ in range(20):
+            try:
+                live = zoterojs.ping().get("version")
+                break
+            except Exception as e:  # noqa: BLE001 —— 只想据此写一句话，不想据此退出
+                err = e
+                time.sleep(0.25)
+
+        if live and live == man["version"]:
+            print(f"已热重载到 v{live}，不用重启 Zotero。")
+        elif live:
+            print(f"⚠ 装的是 v{man['version']}，ping 报的还是 v{live} —— 重启一次 Zotero 再看。")
+        else:
+            print(f"装上了，但 ping 不通（{err}）—— 也可能是面板上的总开关被关掉了。")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,13 @@ const MANIFEST = path.join(ADDON, "manifest.json");
 const prefs = new Map();
 const merged = [];
 const tokenWrites = [];
+const paneRegs = [];          // 面板注册调用，用来断言注册参数
+let panePanes = [];           // 面板“注册表”当前内容，断言没有重复堆积
+let paneSeq = 0;
+const loggedErrors = [];      // Zotero.logError 收到的东西
+let tokenFileOnDisk = true;   // 自检要查 token 文件在不在，测试里可切换
+let confirmAnswer = true;     // Services.prompt.confirm 的替身
+let tokenSeq = 0;             // 让 randomString 每次都不同
 
 class Item {
   constructor(o) { Object.assign(this, o); this.deleted = false; }
@@ -42,7 +49,9 @@ const ITEMS = {
 const Zotero = {
   version: "10.0.2",
   debug: () => {},
-  logError: (e) => { throw e; },
+  // 记一笔再抛：bootstrap 里所有东西都包在 try/catch 里，不记的话"吞掉一个异常"
+  // 和"根本没出错"在测试里长得一模一样（logErr 的 catch 会把抛出也吃掉）。
+  logError: (e) => { loggedErrors.push(String((e && e.message) || e)); throw e; },
   initializationPromise: Promise.resolve(),
   Libraries: { userLibraryID: 1 },
   DataDirectory: { dir: "C:\\Users\\you\\Zotero" },
@@ -50,8 +59,29 @@ const Zotero = {
     get: (k) => prefs.get("extensions.zotero." + k),
     set: (k, v) => prefs.set("extensions.zotero." + k, v),
   },
-  Utilities: { randomString: (n) => "T".repeat(n) },
-  File: { putContentsAsync: async (p, c) => { tokenWrites.push([p, c]); } },
+  // 末尾那位递增：真 randomString 每次都不一样，返回常量的话
+  // 「换 token」这类测试会假绿。长度仍是 n。
+  Utilities: { randomString: (n) => "T".repeat(n - 1) + (tokenSeq++ % 10) },
+  File: {
+    putContentsAsync: async (p, c) => { tokenWrites.push([p, c]); },
+    pathToFile: (p) => ({ exists: tokenFileOnDisk }),
+  },
+  // 照 preferencePanes.js 的行为做替身：显式 id 撞了就抛；不给 id 就每次生成一个
+  // 新的随机 id（真实实现是 plugin-pane-<random>-<pluginID>）—— 正因为如此，
+  // 热重载重复 register 不会报错，只会悄悄多出一块面板，必须靠 unregister 自己收。
+  PreferencePanes: {
+    pluginPanes: [],
+    register: async (o) => {
+      paneRegs.push(o);
+      if (o.id && panePanes.some((p) => p.id === o.id)) {
+        throw new Error(`Pane with ID ${o.id} already registered`);
+      }
+      const id = o.id || `plugin-pane-${paneSeq++}-${o.pluginID}`;
+      panePanes.push({ id, pluginID: o.pluginID, src: o.src });
+      return id;
+    },
+    unregister: (id) => { panePanes = panePanes.filter((p) => p.id !== id); },
+  },
   Item,
   Collection: class {},
   Items: {
@@ -79,6 +109,7 @@ let consoleResets = 0;
 const Services = {
   uuid: { generateUUID: () => ({ toString: () => "{deadbeef-0000-1111-2222-333344445555}" }) },
   scriptSecurityManager: { getSystemPrincipal: () => ({}) },
+  prompt: { confirm: () => confirmAnswer },
   console: {
     getMessageArray: () => consoleMsgs.slice(),
     reset: () => { consoleResets++; },
@@ -107,7 +138,10 @@ const ChromeUtils = {
 const sandboxGlobals = {
   Zotero, Services, Components, ChromeUtils,
   PathUtils: { join: (...a) => a.join("\\") },
-  IOUtils: { writeUTF8: async (p, c) => { tokenWrites.push([p, c]); } },
+  IOUtils: {
+    writeUTF8: async (p, c) => { tokenWrites.push([p, c]); },
+    exists: async () => tokenFileOnDisk,
+  },
   Cu: { Sandbox: () => ({}), evalInSandbox: () => { throw new Error("不该走沙箱退路"); } },
   Ci: {}, Cc: {}, OS: {},
   console,
@@ -198,8 +232,11 @@ const t = async (name, fn) => {
     assert.ok(prefs.get("extensions.zotero.jsbridge.token"), "pref 没写");
   });
 
-  const TOKEN = prefs.get("extensions.zotero.jsbridge.token");
-  const H = { "x-zoterojs-token": TOKEN };
+  // 带鉴权的请求头。故意用 getter 而不是把 token 抄成常量：面板上的「重新生成」
+  // 会把 token 换掉，抄下来的常量从此再也对不上，后面每个断言都变成 403。更坏的是
+  // 闸门排在鉴权之后（这是有意的，见 checkAuth 的注释），403 会盖住本该看到的 503/404，
+  // 看上去像闸门坏了，实际是测试自己拿错了钥匙。
+  const H = { get "x-zoterojs-token"() { return prefs.get("extensions.zotero.jsbridge.token"); } };
   const BADH = {};
 
   console.log("\n[2] ping");
@@ -467,7 +504,183 @@ const t = async (name, fn) => {
     assert.strictEqual(b.logsOmitted, 500 - b.logs.length);
   });
 
-  console.log("\n[8] 生命周期重入");
+  console.log("\n[8] 管理面板与开关");
+  const setPref = (k, v) => sandboxGlobals.Zotero.Prefs.set(k, v);
+  const epCall = (p, opts) => new EP[p]().init(opts);
+  // 改 pref 的测试一律走这里：断言抛了也要把 pref 还原。不还原的话，一个断言失败
+  // 会把 enabled=false 留给后面的测试，于是后继全红 —— 一次真失败看着像塌了一片。
+  const withPref = async (k, v, fn) => {
+    const before = sandboxGlobals.Zotero.Prefs.get(k);
+    setPref(k, v);
+    try { return await fn(); } finally { setPref(k, before); }
+  };
+  // 面板里的元素替身：自检和按钮只用到 getElementById / textContent / value
+  const fakeDoc = () => {
+    const els = {};
+    return { els, getElementById: (id) => (els[id] ||= { textContent: "", value: "" }) };
+  };
+  const pane = () => sandboxGlobals.Zotero.JSBridge;
+
+  await t("startup 注册了管理面板，src 指向 prefs.xhtml", () => {
+    assert.strictEqual(paneRegs.length, 1, `注册了 ${paneRegs.length} 次面板`);
+    assert.strictEqual(paneRegs[0].pluginID, "zoterojs-bridge@local");
+    assert.strictEqual(paneRegs[0].src, "file:///x/prefs.xhtml");
+    // 必须给固定 id：不给的话 Zotero 每次生成新的随机 id，重复注册既不报错也不去重
+    assert.strictEqual(paneRegs[0].id, "zoterojs-bridge-pane", "面板没给固定 id，热重载会堆出多块");
+  });
+  await t("热重载再 startup 一次，侧栏里不会多出第二块面板，也不报错", async () => {
+    const errs = loggedErrors.length;
+    await call("startup", { id: "zoterojs-bridge@local", version: man.version, rootURI: "file:///x/" }, 2);
+    assert.strictEqual(panePanes.length, 1, `面板堆到了 ${panePanes.length} 块`);
+    assert.strictEqual(panePanes[0].id, "zoterojs-bridge-pane");
+    // 不先 unregister 的话，第二次 register 会撞上固定 id 直接抛 —— 抛出被 try/catch
+    // 吞掉，面板列表看着还是 1 块，只有这里能看出它其实没注册成
+    assert.deepStrictEqual(loggedErrors.slice(errs), [], "第二次 startup 报了错，面板多半没注册上");
+  });
+  await t("总开关关着也照样注册面板 —— 否则关掉之后就没地方再打开了", () =>
+    withPref("jsbridge.enabled", false, async () => {
+      await call("startup", { id: "zoterojs-bridge@local", version: man.version, rootURI: "file:///x/" }, 2);
+      assert.strictEqual(panePanes.length, 1, "停用后面板没了，用户只能去改 pref");
+    }));
+  await t("面板文件存在，按钮要用的 id 都在", () => {
+    const p = path.join(ADDON, "prefs.xhtml");
+    assert.ok(fs.existsSync(p), "prefs.xhtml 不存在 —— 装上去面板是空的");
+    const x = fs.readFileSync(p, "utf8");
+    for (const id of ["jsb-token", "jsb-status", "jsb-copy", "jsb-regen", "jsb-rewrite", "jsb-check"]) {
+      assert.ok(x.includes(`id="${id}"`), `面板里没有 ${id}，按钮点了会报错`);
+    }
+  });
+  await t("面板每个 preference= 都在 prefs.js 里有默认值", () => {
+    // 先剥掉 XML 注释 —— 注释里那句 preference="..." 是说明文字，不是绑定
+    const x = fs.readFileSync(path.join(ADDON, "prefs.xhtml"), "utf8").replace(/<!--[\s\S]*?-->/g, "");
+    // 七个可调参数：总开关、只读、四个端点、响应上限。token 不在其中 ——
+    // 那个框是只读展示，由 JSBridge.refreshTokenView 填，不走 preference 绑定。
+    const WANT = [
+      "extensions.zotero.jsbridge.enabled",
+      "extensions.zotero.jsbridge.readonly",
+      "extensions.zotero.jsbridge.endpoint.ping",
+      "extensions.zotero.jsbridge.endpoint.exec",
+      "extensions.zotero.jsbridge.endpoint.merge",
+      "extensions.zotero.jsbridge.endpoint.logs",
+      "extensions.zotero.jsbridge.limit.responseKB",
+    ];
+    const want = [...x.matchAll(/preference="([^"]+)"/g)].map(m => m[1]);
+    // 用「集合相等」而不是「不少于 N 个」：少绑一个和少绑另一个是两种不同的漏，
+    // 数个数看不出来；多绑了一个不存在的 pref 也要挡住。
+    assert.deepStrictEqual([...want].sort(), [...WANT].sort(), "面板绑的参数和预期对不上");
+    const declared = new Set([...fs.readFileSync(path.join(ADDON, "prefs.js"), "utf8")
+      .matchAll(/pref\("([^"]+)"/g)].map(m => m[1]));
+    for (const k of WANT) assert.ok(declared.has(k), `prefs.js 没给默认值: ${k}`);
+  });
+  await t("Zotero.JSBridge 暴露给面板，函数齐全", () => {
+    assert.ok(pane(), "没挂上 —— 面板上每个按钮都会报错");
+    for (const f of ["refreshTokenView", "copyToken", "regenerateToken", "rewriteTokenFile", "selfCheck"]) {
+      assert.strictEqual(typeof pane()[f], "function", `缺 ${f}`);
+    }
+  });
+  await t("自检报出四个端点、总开关、只读和 token 文件", async () => {
+    const doc = fakeDoc();
+    await pane().selfCheck(doc);
+    const out = doc.els["jsb-status"].textContent;
+    assert.ok(out.includes(man.version), out);
+    for (const p of ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs"]) {
+      assert.ok(out.includes(p), `自检没提 ${p}: ${out}`);
+    }
+    assert.ok(out.includes("token 文件"), out);
+  });
+  await t("token 文件不在时自检如实报出来并给修法", async () => {
+    tokenFileOnDisk = false;
+    const doc = fakeDoc();
+    await pane().selfCheck(doc);
+    assert.ok(doc.els["jsb-status"].textContent.includes("重写 token 文件"), "没告诉用户怎么办");
+    tokenFileOnDisk = true;
+  });
+  await t("拿不到剪贴板时不抛错，如实报失败", () => {
+    const doc = fakeDoc();
+    pane().copyToken(doc);
+    assert.ok(doc.els["jsb-status"].textContent.includes("复制失败"), "该报失败");
+  });
+  await t("确认框点取消 → token 不变", async () => {
+    confirmAnswer = false;
+    const before = sandboxGlobals.Zotero.Prefs.get("jsbridge.token");
+    const doc = fakeDoc();
+    await pane().regenerateToken(doc);
+    assert.strictEqual(sandboxGlobals.Zotero.Prefs.get("jsbridge.token"), before, "token 被换掉了");
+    assert.ok(doc.els["jsb-status"].textContent.includes("已取消"));
+    confirmAnswer = true;
+  });
+  await t("确认后换新 token：pref、文件、面板三处都跟上，旧 token 立刻作废", async () => {
+    const before = sandboxGlobals.Zotero.Prefs.get("jsbridge.token");
+    const writes = tokenWrites.length;
+    const doc = fakeDoc();
+    await pane().regenerateToken(doc);
+    const after = sandboxGlobals.Zotero.Prefs.get("jsbridge.token");
+    assert.notStrictEqual(after, before, "token 没换");
+    assert.ok(tokenWrites.length > writes, "没重写 token 文件");
+    assert.strictEqual(doc.els["jsb-token"].value, after, "面板上显示的没刷新");
+    // 换 token 的全部意义就是让旧钥匙作废。这条不验，等于换了个寂寞。
+    const stale = await epCall("/zoterojs/exec",
+      { headers: { "x-zoterojs-token": before }, data: { code: "return 1" } });
+    assert.strictEqual(stale[0], 403, "旧 token 还能用");
+  });
+
+  await t("总开关关掉 → 四个端点全 503，且说得出是哪个开关", () =>
+    withPref("jsbridge.enabled", false, async () => {
+      for (const p of ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs"]) {
+        const r = await epCall(p, { method: "GET", headers: H,
+          searchParams: new URLSearchParams("source=console"),
+          data: { code: "return 1", master: "MASTER01", dups: ["DUPGOOD"] } });
+        assert.strictEqual(r[0], 503, p);
+        // 503 得指明去哪个 pref 打开，否则用户只能翻文档
+        assert.ok(JSON.parse(r[2]).pref.endsWith("jsbridge.enabled"), `${p} 的 503 没说是哪个开关`);
+      }
+    }));
+  await t("单独关掉 exec → exec 404，ping 照常并列出 disabled", () =>
+    withPref("jsbridge.endpoint.exec", false, async () => {
+      const r = await epCall("/zoterojs/exec", { headers: H, data: { code: "return 1" } });
+      assert.strictEqual(r[0], 404);
+      assert.ok(JSON.parse(r[2]).pref.endsWith("endpoint.exec"), "错误里该指出是哪个 pref");
+      const ping = await epCall("/zoterojs/ping", { method: "GET", headers: {} });
+      assert.strictEqual(ping[0], 200);
+      assert.deepStrictEqual(JSON.parse(ping[2]).disabled, ["/zoterojs/exec"]);
+    }));
+  await t("只读模式：exec/merge 403，logs 能读但 clear 403，ping 照常", () =>
+    withPref("jsbridge.readonly", true, async () => {
+      assert.strictEqual((await epCall("/zoterojs/exec",
+        { headers: H, data: { code: "return 1" } }))[0], 403);
+      assert.strictEqual((await epCall("/zoterojs/merge",
+        { headers: H, data: { master: "MASTER01", dups: ["DUPGOOD"] } }))[0], 403);
+      const read = await epCall("/zoterojs/logs", { headers: H, data: null,
+        searchParams: new URLSearchParams("source=console&limit=5") });
+      assert.strictEqual(read[0], 200, "读日志是只读的，不该被拦");
+      const clear = await epCall("/zoterojs/logs", { headers: H, data: null,
+        searchParams: new URLSearchParams("source=console&clear=1") });
+      assert.strictEqual(clear[0], 403, "clear 是破坏性的，只读模式该拦");
+      const ping = await epCall("/zoterojs/ping", { method: "GET", headers: {} });
+      assert.strictEqual(JSON.parse(ping[2]).readonly, true, "ping 该报出只读状态");
+    }));
+  await t("只读关掉后 exec 立刻恢复（读的是实时 pref，不是启动时的快照）", async () => {
+    const r = await epCall("/zoterojs/exec", { headers: H, data: { code: "return 1+1" } });
+    assert.strictEqual(r[0], 200);
+    assert.strictEqual(JSON.parse(r[2]).result, 2);
+  });
+  await t("闸门在鉴权之后：错 token 的响应里不泄漏配置", () =>
+    withPref("jsbridge.readonly", true, async () => {
+      const r = await epCall("/zoterojs/exec", { headers: BADH, data: { code: "return 1" } });
+      assert.strictEqual(r[0], 403);
+      assert.ok(!JSON.parse(r[2]).pref, "未鉴权的响应里漏出了 pref 名");
+    }));
+  await t("响应上限可调：默认不截断，调到 10KB 就截", async () => {
+    const big = { ok: true, logs: [], result: "y".repeat(30000) };
+    assert.ok(!JSON.parse(call("pack", big)[2]).truncated, "默认上限下不该截断");
+    await withPref("jsbridge.limit.responseKB", 10, () => {
+      const t2 = JSON.parse(call("pack", big)[2]);
+      assert.strictEqual(t2.truncated, true, "调小上限后应截断（下限就是 10KB）");
+      assert.ok(t2.note.includes("首选项"), "截断提示该告诉用户在哪儿改");
+    });
+  });
+
+  console.log("\n[9] 生命周期重入");
   const FOREIGN = function () {};
   await t("热重载第二次 startup 后，shutdown 仍还原真正的原件", async () => {
     sandboxGlobals.Zotero.Server.Endpoints["/zoterojs/ping"] = FOREIGN;  // 假装被别的插件占着
@@ -484,6 +697,9 @@ const t = async (name, fn) => {
   await t("其余端点被摘干净", () => {
     assert.deepStrictEqual(Object.keys(sandboxGlobals.Zotero.Server.Endpoints),
       ["/zoterojs/ping"], "除那个假的原件外不该剩东西");
+  });
+  await t("shutdown 摘掉 Zotero.JSBridge，不留全局垃圾", () => {
+    assert.strictEqual(sandboxGlobals.Zotero.JSBridge, undefined);
   });
 
   console.log(`\n${pass} 通过, ${fail} 失败`);

@@ -29,7 +29,7 @@ $ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
 
 - Zotero 7 or later (developed and verified against **Zotero 10.0.2**)
 - Python 3.8+ for the bundled client (any HTTP client works — the protocol is
-  three JSON endpoints)
+  four JSON endpoints)
 
 ## Install
 
@@ -40,7 +40,8 @@ $ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
    in most cases; if the endpoints don't answer, restart Zotero.
 
 Zotero writes a freshly generated token to `<data-dir>/zoterojs-token.txt`.
-The client finds it automatically.
+The client finds it automatically. The plugin adds one pane under
+**Tools → Preferences → JS Bridge** — switches, the token, and a self-check.
 
 ## Usage
 
@@ -78,6 +79,61 @@ Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin`
 header, are dropped by Zotero's own CSRF guard before they reach the plugin.
 Command-line clients are unaffected; browser-side callers need
 `x-zotero-connector-api-version`, as with any Zotero plugin endpoint.
+
+Every endpoint can be switched off individually, and the whole bridge has a
+master switch. See [Settings](#settings).
+
+## Settings
+
+**Tools → Preferences → JS Bridge.** One pane, seven prefs, no restart needed —
+the gates read their pref on each request, so flipping a checkbox takes effect
+on the next call.
+
+| Pref (`extensions.zotero.jsbridge.…`) | Default | Effect when changed |
+| --- | --- | --- |
+| `enabled` | `true` | `false` → all four endpoints return `503` |
+| `readonly` | `false` | `true` → `exec` and `merge` return `403`; `logs` still reads |
+| `endpoint.ping` | `true` | `false` → that path returns `404` |
+| `endpoint.exec` | `true` | |
+| `endpoint.merge` | `true` | |
+| `endpoint.logs` | `true` | |
+| `limit.responseKB` | `1500` | Response cap, clamped to 10–20000 |
+
+`ping` reports the current state, so a client can ask what it's allowed to do
+rather than guessing:
+
+```console
+$ python zoterojs.py ping
+{ "ok": true, "name": "Zotero JS Bridge", "version": "1.0.7", "zotero": "10.0.2",
+  "libraryID": 1, "endpoints": ["/zoterojs/ping", ...], "disabled": [], "readonly": false }
+```
+
+`disabled` lists the paths that are currently switched off, and `readonly` is
+the live value of the read-only switch. Both fields are additive — clients that
+predate them see the same shape they always did.
+
+The pane also carries the token (copy / regenerate / rewrite the token file)
+and a **self-check** button that reports whether the four endpoints are
+registered, what the switches say, and whether the token file is there. The
+self-check is deliberately static: it does not fire an HTTP request at
+`127.0.0.1:23119`, because Zotero's own CSRF guard would kill it and a failure
+would then mean nothing.
+
+Two things worth being precise about:
+
+- **Read-only mode is a refusal, not a sandbox.** It does not parse your code.
+  There is no honest way to decide statically how many side effects a given
+  `exec` can produce, so instead of pretending, it closes the write paths
+  entirely (`exec`, `merge`, and `logs --clear`) and leaves the read paths
+  (`ping`, `logs`) open.
+- **The master switch is enforced on the request path, not at registration.**
+  Disabling the bridge leaves the pane in place, which is the only way back —
+  a plugin that removes its own settings UI when disabled can't be re-enabled
+  from inside Zotero.
+
+Regenerating the token revokes the old one immediately: the pref and
+`zoterojs-token.txt` are rewritten, and clients still holding the old token
+start getting `403`.
 
 ## The `merge` self-check
 
@@ -192,16 +248,22 @@ should accept knowingly:
 - **No TLS.** Traffic is loopback plaintext.
 
 Mitigations that are present: token required on `exec`, `merge`, and `logs`;
-constant-time comparison against the stored token; a 1.5 MB response cap; and
-endpoint cleanup on `shutdown()`.
+constant-time comparison against the stored token; a configurable response cap
+(1.5 MB by default); a master switch and per-endpoint switches; a read-only mode
+that closes the write paths; and endpoint cleanup on `shutdown()`.
+
+The switches are a blast-radius control, not a security boundary. They reduce
+what a script *you* run can do, and they are worth having when you hand a
+terminal to something less careful than you. They do not contain an attacker who
+already has the token — anyone holding it can flip the prefs back.
 
 > The constant-time comparison is real as of v1.0.6, but it was *claimed* from
 > v1.0.0 while the code did a plain `!==` the whole time. If you audited an
 > earlier version against this README, the README was wrong, not your audit.
 
-If that trade is wrong for you, don't install it — or set
-`extensions.zotero.jsbridge.enabled` to `false` to disable the endpoints while
-leaving the plugin installed.
+If that trade is wrong for you, don't install it — or turn off the master
+switch in **Tools → Preferences → JS Bridge**, which disables the endpoints
+while leaving the plugin installed.
 
 To remove it completely: uninstall the plugin, then delete the pref
 `extensions.zotero.jsbridge.token` and the `zoterojs-token.txt` file.
@@ -235,10 +297,29 @@ to `Zotero.Server.Endpoints[path]` — the server does `new this.endpoint()` —
 and give `init` exactly one formal parameter so it takes the object-argument
 branch.
 
+**Preference panes are less forgiving than the docs suggest.** Four things this
+project got wrong before reading `chrome/content/zotero/xpcom/preferencePanes.js`:
+
+- The pane is an XHTML **fragment**, not a document. XUL is the default
+  namespace, so HTML tags need an explicit prefix (`<html:input>`, `<html:h2>`).
+- `register()` given no `id` mints `plugin-pane-<random>-<pluginID>`. A second
+  `register()` therefore **does not throw** — it quietly adds a *second* pane to
+  the sidebar. Give an explicit `id` and `unregister()` it first, or your users
+  accumulate duplicate panes on every hot reload.
+- Panes registered by a plugin are removed on shutdown by Zotero's own
+  `Plugins.addObserver({ shutdown })`, filtered by `pluginID`. That observer does
+  not run on every hot-reload path — `startup()` can be called again without
+  `shutdown()` having run, which is the same re-entrancy trap as the endpoint
+  table.
+- `preference="extensions.zotero.foo"` on a control is bound by Zotero's own
+  prefs code (`_syncFromPref` / `_syncToPrefOnModify`); no JS needed, but the
+  name must be **fully qualified** and must have a default in `prefs.js`, or the
+  control appears to work and writes to a pref nobody reads.
+
 ## Development
 
 ```bash
-node test_bridge.js              # 56 tests against stubbed Zotero globals
+node test_bridge.js              # 77 tests against stubbed Zotero globals
 python make_icon.py --preview    # icon variants sheet, writes nothing
 python build.py                  # package the xpi
 python build.py --bump           # bump patch version first
@@ -250,9 +331,17 @@ Tests need no Zotero install — they load the real `bootstrap.js` into a Node
 directly. Among other things they assert that every icon the manifest declares
 is actually present and is a PNG of the declared pixel size.
 
+The stubs are written to match the real modules rather than to be convenient —
+`PreferencePanes.register` reproduces the duplicate-id throw and the
+`plugin-pane-<random>-<pluginID>` id generation from `preferencePanes.js`,
+because those two facts are what make a naive re-registration on hot reload fail
+silently.
+
 Bump the version on every build; Zotero ignores a reinstall with an unchanged
 version. `build.py` fails loudly if a manifest-declared icon didn't make it
-into the archive — the failure mode it was written to prevent.
+into the archive, and if a `preference="…"` in the pane has no default in
+`prefs.js` — the two failure modes it was written to prevent, both of which
+otherwise show up as a control that looks fine until you click it.
 
 ## 中文说明
 
@@ -295,6 +384,13 @@ python zoterojs.py logs --min-level warning
 永远有货、不用配置；`debug` 默认是空的，**这不是坏了**——它只在
 `extensions.zotero.debug.store` 打开时才记录，而且那个 pref 是**一次性**的，
 Zotero 启动读完就自己设回 `false`。设好重启，能拿到一个会话的输出。
+
+**管理面板**在 **工具 → 首选项 → JS Bridge**，改完即生效不用重启：总开关
+（关掉后四个端点全 `503`）、只读模式（`exec`/`merge` 返 `403`，`logs` 照读）、
+四个端点各自的开关（关掉返 `404`）、响应上限（默认 1.5 MB）、以及 token 的
+复制 / 重新生成 / 重写文件，外带一个自检按钮。两个容易误解的地方：**只读模式是
+拒绝服务不是沙箱**——它不解析你的代码，而是把写入口整个关掉；**总开关是在请求
+路径上拦，不是不注册端点**，停用后面板还在——不然关掉之后就再没有地方打开了。
 
 ## License
 

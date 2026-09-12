@@ -29,6 +29,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 三个 .py（客户端 / 打包 / 画图标）没有单元测试，至少保证能编译过、import 得动
+      - name: Byte-compile the Python client and scripts
+        run: |
+          python -m py_compile zoterojs.py build.py make_icon.py
+          python -c "import zoterojs, build"
+
       # 打包顺带校验 manifest 声明的图标确实进了包
       - name: Build xpi
         run: python build.py
