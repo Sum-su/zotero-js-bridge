@@ -8,7 +8,7 @@ storage backends, bulk-editing fields, calling internal modules — can only be
 done from inside the Zotero process. Normally that means opening
 **Tools → Developer → Run JavaScript** and pasting code by hand, every time.
 
-This plugin opens four local HTTP endpoints on the HTTP server Zotero already
+This plugin opens seven local HTTP endpoints on the HTTP server Zotero already
 runs (`127.0.0.1:23119`), so a script can do it instead.
 
 ```console
@@ -17,7 +17,16 @@ $ python zoterojs.py exec "return Zotero.Libraries.userLibraryID"
 
 $ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
 { "ok": true, "dryRun": true, "report": [{ "key": "EFGH5678", "merged": false, ... }] }
+
+$ python zoterojs.py query --title 物理化学 --limit 2   # no SQL required
+$ python zoterojs.py doctor                             # read-only library health check
+$ python zoterojs.py apply ops.json                     # dry-run until you pass --yes
+$ python zoterojs.py backup                             # VACUUM INTO + rotation
 ```
+
+Three of the seven can write (`exec` / `merge` / `apply`); the other four are
+read-only (`ping` / `logs` / `query` / `doctor`). Read-only mode closes the
+write paths and leaves the read ones open.
 
 > [!WARNING]
 > These endpoints execute **arbitrary JavaScript inside Zotero** with full
@@ -29,7 +38,7 @@ $ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
 
 - Zotero 7 or later (developed and verified against **Zotero 10.0.2**)
 - Python 3.8+ for the bundled client (any HTTP client works — the protocol is
-  four JSON endpoints)
+  seven JSON endpoints)
 
 ## Install
 
@@ -41,7 +50,8 @@ $ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
 
 Zotero writes a freshly generated token to `<data-dir>/zoterojs-token.txt`.
 The client finds it automatically. The plugin adds one pane under
-**Tools → Preferences → JS Bridge** — switches, the token, and a self-check.
+**Tools → Preferences → JS Bridge** — switches, the token, a **Backup now**
+button, and a self-check. Every switch takes effect immediately.
 
 ## Usage
 
@@ -49,7 +59,16 @@ The client finds it automatically. The plugin adds one pane under
 python zoterojs.py ping                            # health check, no token needed
 python zoterojs.py exec "return Zotero.version"
 python zoterojs.py merge MASTERKEY DUPKEY --dry-run
+python zoterojs.py query --title 物理化学 --limit 20
+python zoterojs.py doctor [duplicates orphanStorage] [--all] [--days 30]
+python zoterojs.py apply ops.json [--yes] [--keep-going]
+python zoterojs.py backup
 ```
+
+`query` prints item keys that feed straight into `merge` / `apply` — so the
+whole loop is query → dry-run → confirm → write, without hand-converting
+anything. `apply` and `merge` both default to a dry run; nothing is written
+until you pass `--yes`.
 
 ```python
 import zoterojs as zjs
@@ -57,6 +76,10 @@ import zoterojs as zjs
 zjs.execv("return Zotero.Items.get(1).getField('title')")
 zjs.merge("ABCD1234", ["EFGH5678"])                 # real merge
 zjs.merge("IJKL9012", ["MNOP3456"], dry_run=True)   # self-check only
+zjs.query(title="导水裂隙带", limit=5)               # structured, no SQL
+zjs.doctor()                                        # full sweep, no network
+zjs.apply(ops, dry_run=True)                        # dry run is the default here too
+zjs.backup()                                        # VACUUM INTO + rotation
 ```
 
 Inside `exec` you get `Zotero`, `Services`, `ChromeUtils`, `Components`, `Cu`,
@@ -71,8 +94,11 @@ response). Top-level `await` and `return` both work.
 | POST | `/zoterojs/exec` | `X-ZoteroJS-Token` |
 | POST | `/zoterojs/merge` | `X-ZoteroJS-Token` |
 | GET, POST | `/zoterojs/logs` | `X-ZoteroJS-Token` |
+| GET, POST | `/zoterojs/query` | `X-ZoteroJS-Token` |
+| GET, POST | `/zoterojs/doctor` | `X-ZoteroJS-Token` |
+| POST | `/zoterojs/apply` | `X-ZoteroJS-Token` |
 
-All four ride on Zotero's own server — nothing new is bound, and no socket is
+All seven ride on Zotero's own server — nothing new is bound, and no socket is
 held open, so Zotero still exits cleanly.
 
 Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin`
@@ -85,26 +111,31 @@ master switch. See [Settings](#settings).
 
 ## Settings
 
-**Tools → Preferences → JS Bridge.** One pane, seven prefs, no restart needed —
+**Tools → Preferences → JS Bridge.** One pane, no restart needed —
 the gates read their pref on each request, so flipping a checkbox takes effect
 on the next call.
 
 | Pref (`extensions.zotero.jsbridge.…`) | Default | Effect when changed |
 | --- | --- | --- |
-| `enabled` | `true` | `false` → all four endpoints return `503` |
-| `readonly` | `false` | `true` → `exec` and `merge` return `403`; `logs` still reads |
+| `enabled` | `true` | `false` → all seven endpoints return `503` |
+| `readonly` | `false` | `true` → `exec` / `merge` / `apply` return `403`; reads still work |
 | `endpoint.ping` | `true` | `false` → that path returns `404` |
 | `endpoint.exec` | `true` | |
 | `endpoint.merge` | `true` | |
 | `endpoint.logs` | `true` | |
+| `endpoint.query` | `true` | |
+| `endpoint.doctor` | `true` | |
+| `endpoint.apply` | `true` | |
 | `limit.responseKB` | `1500` | Response cap, clamped to 10–20000 |
+| `backup.enabled` | `false` | `true` → back up before every `merge` / `apply` |
+| `backup.keep` | `5` | How many backups to keep, clamped to 1–200 |
 
 `ping` reports the current state, so a client can ask what it's allowed to do
 rather than guessing:
 
 ```console
 $ python zoterojs.py ping
-{ "ok": true, "name": "Zotero JS Bridge", "version": "1.0.7", "zotero": "10.0.2",
+{ "ok": true, "name": "Zotero JS Bridge", "version": "1.0.11", "zotero": "10.0.2",
   "libraryID": 1, "endpoints": ["/zoterojs/ping", ...], "disabled": [], "readonly": false }
 ```
 
@@ -112,8 +143,9 @@ $ python zoterojs.py ping
 the live value of the read-only switch. Both fields are additive — clients that
 predate them see the same shape they always did.
 
-The pane also carries the token (copy / regenerate / rewrite the token file)
-and a **self-check** button that reports whether the four endpoints are
+The pane also carries the token (copy / regenerate / rewrite the token file),
+a **Backup now** button, and a **self-check** button that reports whether the
+seven endpoints are
 registered, what the switches say, and whether the token file is there. The
 self-check is deliberately static: it does not fire an HTTP request at
 `127.0.0.1:23119`, because Zotero's own CSRF guard would kill it and a failure
@@ -124,8 +156,10 @@ Two things worth being precise about:
 - **Read-only mode is a refusal, not a sandbox.** It does not parse your code.
   There is no honest way to decide statically how many side effects a given
   `exec` can produce, so instead of pretending, it closes the write paths
-  entirely (`exec`, `merge`, and `logs --clear`) and leaves the read paths
-  (`ping`, `logs`) open.
+  entirely (`exec`, `merge`, `apply`, and `logs --clear`) and leaves the read
+  paths (`ping`, `logs`, `query`, `doctor`) open. `apply` is gated even for a
+  dry run: read-only means "this endpoint is not available", not "you may
+  rehearse".
 - **The master switch is enforced on the request path, not at registration.**
   Disabling the bridge leaves the pane in place, which is the only way back —
   a plugin that removes its own settings UI when disabled can't be re-enabled
@@ -247,10 +281,21 @@ should accept knowingly:
   pretend to be.
 - **No TLS.** Traffic is loopback plaintext.
 
-Mitigations that are present: token required on `exec`, `merge`, and `logs`;
+Mitigations that are present: token required on everything except `ping`;
 constant-time comparison against the stored token; a configurable response cap
 (1.5 MB by default); a master switch and per-endpoint switches; a read-only mode
 that closes the write paths; and endpoint cleanup on `shutdown()`.
+
+Two more that arrived with the v1.0.8–1.0.11 features:
+
+- **`apply` defaults to a dry run.** Writing is opt-in (`--yes`), and every op
+  can carry an `expect` block that skips the item unless the current value still
+  matches. The report always shows the before → after diff and any
+  `collectionItems` membership the write would drop.
+- **Backups before writes, and a failed backup aborts the write.** With
+  `backup.enabled` on, `merge` and `apply` take a full `VACUUM INTO` snapshot
+  first; if that fails, nothing is written. An opt-in safety net that silently
+  doesn't catch anything is worse than no safety net.
 
 The switches are a blast-radius control, not a security boundary. They reduce
 what a script *you* run can do, and they are worth having when you hand a
@@ -315,16 +360,90 @@ project got wrong before reading `chrome/content/zotero/xpcom/preferencePanes.js
   prefs code (`_syncFromPref` / `_syncToPrefOnModify`); no JS needed, but the
   name must be **fully qualified** and must have a default in `prefs.js`, or the
   control appears to work and writes to a pref nobody reads.
+- **The pane uses fully-qualified names; JS must use short ones.** Those two
+  call the same pref through different paths:
+
+  ```js
+  // preferences.js:447 / :474 — the pane passes global=true
+  Zotero.Prefs.get(preference, true);
+  Zotero.Prefs.set(preference, value, true);
+
+  // Zotero.Prefs.get — everything else, prefix added for you
+  pref = global ? pref : ZOTERO_CONFIG.PREF_BRANCH + pref;   // "extensions.zotero."
+  ```
+
+  Mixing them up **fails silently**: `Zotero.Prefs.set` *creates* a missing
+  pref, so `set('extensions.zotero.x', v)` followed by a `get` reads back `v`
+  while your code — reading the short name — still sees the default. Cost me a
+  false "the rotation is broken" diagnosis; `test_bridge.js` now records any
+  misuse and fails on it.
+
+**Two SQL traps worth knowing before you write your own queries:**
+
+```js
+// ✗ rejected: "Please enter a LIKE clause with bindings"
+"... WHERE value LIKE '%x%'"
+// ✓ the pattern has to be bound
+"... WHERE value LIKE ?", ['%x%']
+```
+
+That guard lives in **Firefox's** `modules/Sqlite.sys.mjs`
+(`/\bLIKE\b\s(?![@:?])/i`), not in Zotero's code — searching Zotero's own
+`omni.ja` for it finds nothing. It is also stricter than "no quotes": a
+column name or subquery after `LIKE` is rejected too. And it is **unconditional**
+— omitting the params argument does not slip past it (`params = null` is just a
+default; the check is on the next line). And `deleteLog` **does not exist** in
+Zotero 10 (`no such table`) — `deletedItems` is the authoritative trash record.
 
 ## Development
 
 ```bash
-node test_bridge.js              # 77 tests against stubbed Zotero globals
+node test_bridge.js              # 136 tests against stubbed Zotero globals
+python mutate.py                 # revert each fix, confirm the suite goes red
 python make_icon.py --preview    # icon variants sheet, writes nothing
 python build.py                  # package the xpi
 python build.py --bump           # bump patch version first
 python build.py --install        # build, then install into a running Zotero
+python check_backup.py [DIR]     # open each backup read-only, verify integrity
 ```
+
+**Green tests only prove the suite ran.** `mutate.py` reverts 22 individual
+fixes — one at a time, restoring the file in a `finally` — and checks the suite
+turns red for each. All 22 are currently caught. It is the difference between
+"the tests pass" and "the tests are watching".
+
+Seventeen of them mutate `addon/bootstrap.js`; five mutate `test_bridge.js`
+itself. The first of those reverts the stubbed SQL guard to a looser version
+that once made the stub accept a query the real Zotero rejects; the rest undo
+behaviours copied into the stub from the real library. **A guard copied
+into the stub from the real thing needs its own mutant** — otherwise it is a
+comment, not a check.
+
+CI runs both, and a mutant that stops landing **fails the build** rather than
+being skipped: an anchor that no longer matches means the behaviour it pinned
+has moved, and the one thing worth fearing here is a guard that quietly stopped
+watching. (The `build` job separately re-runs `build.py` and fails if
+`updates.json` drifts from the manifest — the "marketplace shows the new
+version, existing users get no update" bug.)
+
+Getting this wrong is not hypothetical. The stub's `Item.setType` used to clear
+`collections`, "because changing the type detaches the item". That was invented,
+the test asserted the invented behaviour, and it passed — until the same thing
+was run against the real library and `collectionItems` turned out not to move at
+all. **A stub shaped wrong makes its tests self-confirming.** The behaviour that
+*does* detach a collection is setting `parentItemID` (a child item cannot be in
+a collection), which is also the only mechanism verified live.
+
+That mechanism turned out to have a **second half, on the other item**.
+Parenting a standalone attachment transfers its collections to the *parent*
+(`item.js:1944`, "remove from any collections where it existed previously and
+add parent instead"), so the attachment leaves a collection and the parent joins
+it. `apply`'s diff originally watched only the item being written, so it
+reported the loss and said nothing about the gain — the same class of silent
+change the endpoint exists to catch, one item over. It now watches the parent
+too, and the dry run predicts the transfer. The parent's save passes
+`skipDateModifiedUpdate`, so its `dateModified` never moves: you cannot find
+this afterwards by looking for recently-changed items.
 
 Tests need no Zotero install — they load the real `bootstrap.js` into a Node
 `vm` context with stubbed globals, then drive the endpoint constructors
@@ -335,7 +454,17 @@ The stubs are written to match the real modules rather than to be convenient —
 `PreferencePanes.register` reproduces the duplicate-id throw and the
 `plugin-pane-<random>-<pluginID>` id generation from `preferencePanes.js`,
 because those two facts are what make a naive re-registration on hot reload fail
-silently.
+silently. Where the real Zotero *rejects* something — like the `LIKE` guard — the
+guard is copied into the stub verbatim, so a query that would throw on a real
+library fails here instead.
+
+Two assertions don't test the plugin at all; they test whether the harness is
+still honest, because both failure modes are silent. The SQL router records any
+statement it didn't recognize (an unmatched query returns an empty array and the
+assertion passes having verified nothing), and the `Prefs` stub records any
+pref read or written with a fully-qualified name where a short one was required
+(a missing pref falls back to its default, so "the switch didn't work" and "the
+switch was never on" look identical).
 
 Bump the version on every build; Zotero ignores a reinstall with an unchanged
 version. `build.py` fails loudly if a manifest-declared icon didn't make it
@@ -351,8 +480,9 @@ Zotero 的插件 API 没有进程外通道。凡是连接器 API 覆盖不到的
 搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。常规做法是打开
 **工具 → 开发者 → Run JavaScript**，每次手动贴代码。
 
-这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了四个 HTTP
+这个插件在 Zotero 本来就在跑的本地服务器（`127.0.0.1:23119`）上挂了七个 HTTP
 端点，让脚本可以代劳。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
+其中能写的是 `exec` / `merge` / `apply`，只读的是 `ping` / `logs` / `query` / `doctor`。
 
 > **安全提醒**：这些端点能在 Zotero 里执行**任意 JS**，可读写你整个库。
 > 任何能读到 token 文件的进程都能删掉你的库。这是个人自动化工具，不是加固过的
@@ -367,6 +497,10 @@ python zoterojs.py ping
 python zoterojs.py exec "return (await Zotero.Items.getAll(1, true)).length"
 python zoterojs.py merge 主条目KEY 重复KEY --dry-run
 python zoterojs.py logs --min-level warning
+python zoterojs.py query --title 物理化学 --limit 20
+python zoterojs.py doctor
+python zoterojs.py apply ops.json          # 不给 --yes 就是演练
+python zoterojs.py backup
 ```
 
 **最容易踩的坑**：Zotero 10 里 `Zotero.Items.getAll` / `getDeleted` / `getAsync`
@@ -386,11 +520,24 @@ python zoterojs.py logs --min-level warning
 Zotero 启动读完就自己设回 `false`。设好重启，能拿到一个会话的输出。
 
 **管理面板**在 **工具 → 首选项 → JS Bridge**，改完即生效不用重启：总开关
-（关掉后四个端点全 `503`）、只读模式（`exec`/`merge` 返 `403`，`logs` 照读）、
-四个端点各自的开关（关掉返 `404`）、响应上限（默认 1.5 MB）、以及 token 的
-复制 / 重新生成 / 重写文件，外带一个自检按钮。两个容易误解的地方：**只读模式是
-拒绝服务不是沙箱**——它不解析你的代码，而是把写入口整个关掉；**总开关是在请求
-路径上拦，不是不注册端点**，停用后面板还在——不然关掉之后就再没有地方打开了。
+（关掉后七个端点全 `503`）、只读模式（`exec`/`merge`/`apply` 返 `403`，读的口子照开）、
+七个端点各自的开关（关掉返 `404`）、响应上限（默认 1.5 MB）、备份开关与保留份数、
+以及 token 的复制 / 重新生成 / 重写文件，外带**立即备份**和自检两个按钮。
+两个容易误解的地方：**只读模式是拒绝服务不是沙箱**——它不解析你的代码，
+而是把写入口整个关掉；**总开关是在请求路径上拦，不是不注册端点**，
+停用后面板还在——不然关掉之后就再没有地方打开了。
+
+**三个新端点的分工**：`query` 让你**不用写 SQL** 就能查（条件名和算符都现查
+`Zotero.SearchConditions`，不认识就报 400 并列出可选项，不猜）；
+`doctor` 一次跑完七项只读体检，**默认不联网**（`sync` 要连 zotero.org，得点名要）；
+`apply` 批量改元数据，**默认演练**，每条 op 可带 `expect` 前置断言，
+并且**自动报出集合归属差分**——因为把条目挂成子条目会**静默摘掉它的集合**。
+`query` 吐出的 `key` 可以直接喂给 `merge` / `apply`，三个端点串成
+查询 → 演练 → 确认 → 写一条管道。
+
+**备份**用 SQLite 的 `VACUUM INTO` 出一份干净单文件副本（不动正在用的库，
+目标已存在则拒写），按份数自动轮转。开了「写操作前自动备份」之后，
+merge / apply 会先备一份，**备份失败就中止这次写**——兜不住还照写等于这个开关白开。
 
 ## License
 

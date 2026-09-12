@@ -6,7 +6,11 @@
     import zoterojs as zjs
     zjs.ping()
     zjs.exec("return Zotero.Items.get(1).getField('title')")
+    zjs.query(title="岩石", limit=20)          # 只读，返回的 key 可喂给 merge / apply
+    zjs.doctor()                                # 一键库体检，全部只读
     zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)
+    zjs.apply([{"item": "ABCD1234", "set": {"date": "2021"}}])   # 默认只演练
+    zjs.backup()
 
 命令行：
     python zoterojs.py ping
@@ -15,6 +19,13 @@
     python zoterojs.py logs [--source console|debug|both] [--min-level warn]
                             [--limit N] [--grep TEXT] [--category TEXT]
                             [--since EPOCH_MS] [--clear]
+    python zoterojs.py query [--title T] [--doi D] [--creator C] [--collection KEY]
+                             [--tag T] [--item-type TYPE] [--q TEXT] [--unfiled]
+                             [--where 'date=isAfter:2020'] [--fields DOI,ISBN]
+                             [--limit N] [--no-collections]
+    python zoterojs.py doctor [CHECK ...] [--all] [--days N]
+    python zoterojs.py apply ops.json [--yes] [--keep-going]
+    python zoterojs.py backup
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.environ.get("ZOTEROJS_BASE", "http://127.0.0.1:23119")
@@ -170,6 +182,32 @@ def _post(path: str, payload: dict, auth: bool = True, timeout: int = 300) -> di
         ) from None
 
 
+def _get(path: str, params: dict = None, timeout: int = 300,
+         auth: bool = True) -> dict:
+    """GET 带查询串。值里的 dict / list 自动转 JSON ——
+    端点那边（readParams 的 decodeParam）会把看着像结构的字符串解回来，
+    所以 where=[{...}] 这种参数用 GET 传得进去，不必改成 POST。"""
+    q = {}
+    for k, v in (params or {}).items():
+        if v is None or v == "" or v == []:
+            continue
+        q[k] = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+    url = BASE + path + ("?" + urllib.parse.urlencode(q) if q else "")
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "zoterojs-python/1.0")
+    if auth:
+        req.add_header("X-ZoteroJS-Token", token())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from None
+    except urllib.error.URLError as e:
+        raise ZoteroJSError(
+            f"连不上 {BASE}{path}：{e.reason}\nZotero 开着吗？插件装了吗？"
+        ) from None
+
+
 def ping() -> dict:
     """健康检查，不需要 token。"""
     req = urllib.request.Request(BASE + "/zoterojs/ping")
@@ -241,6 +279,152 @@ def logs(source: str = "console", min_level: str = "all", limit: int = 100,
     return _post("/zoterojs/logs", payload, timeout=timeout)
 
 
+def query(title: str = None, doi: str = None, isbn: str = None, creator: str = None,
+          collection: str = None, tag: str = None, item_type: str = None,
+          key: str = None, q: str = None, unfiled: bool = False,
+          where=None, fields=None, limit: int = 50,
+          include_collections: bool = True, timeout: int = 120) -> dict:
+    """结构化只读查询。**返回的 items[].key 可以直接喂给 merge / apply。**
+
+    参数是简写，服务端会翻成 Zotero 自己的搜索条件（所以不用写 SQL，
+    也就碰不到 LIKE 必须带绑定、字符串里的字面问号、全角字符这类坑）。
+
+    title / doi / isbn / creator / collection / tag / item_type / key / q
+        q 是「标题+作者+年份」，最像人在搜索框里敲的那种
+    unfiled=True     只看未分类
+    where=[{"field": "date", "op": "isAfter", "value": "2020"}, ...]
+        简写不够用时用这个，field / op 必须是 Zotero.SearchConditions 认识的，
+        写错了服务端会 400 并把可用的列出来
+    fields=["DOI", "publicationTitle"]   额外回哪些字段
+    """
+    params = {
+        "title": title, "doi": doi, "isbn": isbn, "creator": creator,
+        "collection": collection, "tag": tag, "itemType": item_type,
+        "key": key, "q": q, "unfiled": "true" if unfiled else None,
+        "where": where, "fields": fields, "limit": limit,
+        "includeCollections": "true" if include_collections else "false",
+    }
+    return _get("/zoterojs/query", params, timeout=timeout)
+
+
+DOCTOR_CHECKS = ["orphanStorage", "unfiled", "attachmentTitle",
+                 "duplicateFilenames", "duplicates", "trashWriteback", "sync"]
+
+
+def doctor(checks=None, all_checks: bool = False, days: int = 30,
+           timeout: int = 300) -> dict:
+    """一键库体检，全部只读。
+
+    checks 里可选的：orphanStorage（孤儿附件目录）/ unfiled（未分类）/
+    attachmentTitle（标题停在导入器默认值的附件）/ duplicateFilenames（同一父条目下的
+    同名附件）/ duplicates（同 DOI / ISBN）/ trashWriteback（回收站里还在被改写的条目）/
+    sync（**要连 zotero.org，默认不跑**，得点名要）
+
+    不传 checks 就跑除 sync 之外的全部 —— 一个「体检」按钮不该悄悄往外发请求。
+    """
+    params = {"days": days}
+    if all_checks:
+        params["all"] = "true"
+    elif checks:
+        params["checks"] = ",".join(checks) if isinstance(checks, (list, tuple)) else str(checks)
+    return _get("/zoterojs/doctor", params, timeout=timeout)
+
+
+def apply(ops, dry_run: bool = True, stop_on_error: bool = True,
+          timeout: int = 300) -> dict:
+    """批量改元数据。**默认 dry_run=True** —— 先看它打算改什么，再真改。
+
+    ops 是列表，每项形如：
+
+        {"item": "KEY", "set": {"title": "新标题", "date": "2021"}}
+        {"item": "KEY", "setCreators": ["张三", "李四"]}
+        {"item": "KEY", "setType": "book"}
+        {"item": "KEY", "parent": "父条目KEY"}
+        {"item": "KEY", "addToCollection": "集合KEY"}
+        {"item": "KEY", "removeFromCollection": "集合KEY"}
+        {"item": "KEY", "expect": {"title": "它现在应该长的样子"}, "set": {...}}
+
+    字符串形式的创建者按**单字段模式**写（中文名交给 Zotero 自动拆会被按首字硬拆）。
+    expect 不符就跳过那一条 —— 宁可不动，也别对着错的条目下手。
+
+    每条改完会报 collectionsBefore / collectionsAfter。**挂父级（把条目变成别人的子条目）
+    会静默摘掉该条目的集合归属** —— 集合里不许有子条目。差分里出现 collectionsLost 就是它，
+    按提示用 addToCollection 补回去。
+    （`setType` **不会**摘集合，别把它算进去：2026-09-12 真机实测 + 读源码都确认了。）
+
+    ⚠️ 挂父级还有**第二重**副作用，落在**父条目**上：Zotero 会把子条目原有的集合归属
+    整个转给父条目（item.js:1944-1967），所以父条目会凭空多出几个集合。
+    报告里对应 parentItem / parentCollectionsGained，演练时是 wouldGiveParent。
+    挂的时候两个条目都要看，只盯着被写的那一个会漏掉一半。
+    """
+    return _post("/zoterojs/apply",
+                 {"ops": list(ops), "dryRun": dry_run, "stopOnError": stop_on_error},
+                 timeout=timeout)
+
+
+def backup(timeout: int = 600) -> dict:
+    """立刻备份整个库（VACUUM INTO，写一份干净的单文件副本，不动正在用的库）。
+
+    落到数据目录的 jsbridge-backups/，文件名带时间戳，按 jsbridge.backup.keep
+    轮转（默认留 5 份）。面板上「立即备份」按钮走的是同一段代码。
+    """
+    r = execv("return await Zotero.JSBridge.backupNow();", timeout=timeout)
+    if not isinstance(r, dict):
+        raise ZoteroJSError(f"备份返回了意料之外的东西：{r!r}")
+    if not r.get("ok"):
+        raise ZoteroJSError(f"备份失败：{r.get('error')}\n（目标目录 {r.get('dir')}）")
+    return r
+
+
+def _split(v: str):
+    return [s.strip() for s in str(v).split(",") if s.strip()]
+
+
+def _json_arg(v: str):
+    """`--where '[{"field":"date","op":"isAfter","value":"2020"}]'`。
+    也收只有一项时的简写：`--where date=isAfter:2020`。"""
+    s = str(v).strip()
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            val = json.loads(s)
+            return val if isinstance(val, list) else [val]
+        except ValueError as e:
+            raise SystemExit(f"--where 不是合法 JSON：{e}")
+    out = []
+    for part in s.split(","):
+        if "=" not in part or ":" not in part:
+            raise SystemExit(f"--where 看不懂 {part!r}；要么给 JSON，要么写 field=op:value")
+        field, rest = part.split("=", 1)
+        op, value = rest.split(":", 1)
+        out.append({"field": field.strip(), "op": op.strip(), "value": value.strip()})
+    return out
+
+
+def _parse_flags(args, value_flags, bool_flags):
+    """命令行小工具。返回 (kwargs, 错误信息)。不认识的长参数一律报错 ——
+    静默忽略一个拼错的 --limt 会让用户以为限制生效了。"""
+    kw, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        if a in bool_flags:
+            k, v = bool_flags[a]
+            kw[k] = v
+            i += 1
+            continue
+        if a in value_flags:
+            if i + 1 >= len(args):
+                return {}, f"{a} 后面要给个值"
+            k, cast = value_flags[a]
+            try:
+                kw[k] = cast(args[i + 1])
+            except (ValueError, SystemExit) as e:
+                return {}, f"{a} 的值不对：{e}"
+            i += 2
+            continue
+        return {}, f"未知参数: {a}"
+    return kw, None
+
+
 def _main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -310,6 +494,99 @@ def _main(argv):
                 print(d["note"], file=sys.stderr)
             elif d.get("text"):
                 print(d["text"])
+    elif cmd == "query":
+        kw, err = _parse_flags(argv[2:], {
+            "--title": ("title", str), "--doi": ("doi", str), "--isbn": ("isbn", str),
+            "--creator": ("creator", str), "--collection": ("collection", str),
+            "--tag": ("tag", str), "--item-type": ("item_type", str),
+            "--key": ("key", str), "--q": ("q", str),
+            "--limit": ("limit", int), "--fields": ("fields", _split),
+            "--where": ("where", _json_arg),
+        }, {"--unfiled": ("unfiled", True),
+            "--no-collections": ("include_collections", False)})
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        res = query(**kw)
+        print(f"命中 {res['total']} 条" + (f"，显示前 {res['returned']} 条" if res.get("omitted") else ""),
+              file=sys.stderr)
+        for it in res["items"]:
+            cols = "、".join(c["name"] for c in (it.get("collections") or []))
+            who = "; ".join(it.get("creators") or [])
+            print(f"{it['key']}  {(it.get('date') or ''):10} {it['itemType']:14} "
+                  f"{(it.get('title') or '')[:60]}")
+            if who or cols:
+                print(f"{'':10}{who}{'  ← ' + cols if cols else ''}")
+    elif cmd == "doctor":
+        want = [a for a in argv[2:] if not a.startswith("--")]
+        kw = {}
+        if want:
+            kw["checks"] = want
+        if "--all" in argv:
+            kw["all_checks"] = True
+        if "--days" in argv:
+            i = argv.index("--days")
+            if i + 1 >= len(argv):
+                print("--days 后面要给个值", file=sys.stderr)
+                return 1
+            kw["days"] = int(argv[i + 1])
+        res = doctor(**kw)
+        print(f"体检完成 · {res['ms']} ms · 跑了 {', '.join(res['ran'])}", file=sys.stderr)
+        if "sync" not in res["ran"]:
+            print("（sync 要连 zotero.org，要的话加 --all 或直接写 sync）", file=sys.stderr)
+        print(json.dumps(res["checks"], ensure_ascii=False, indent=2))
+    elif cmd == "apply":
+        # 默认 dry-run，真写必须显式 --yes。批量改元数据不该有一次「手滑就改了」的机会。
+        path = argv[2] if len(argv) > 2 and not argv[2].startswith("--") else None
+        if not path:
+            print("用法: python zoterojs.py apply ops.json [--yes] [--keep-going]\n"
+                  "  ops.json 是 apply() 的 ops 列表，照它上面的格式写\n"
+                  "  默认只演练，确认无误再加 --yes 真写", file=sys.stderr)
+            return 1
+        with open(path, encoding="utf-8") as f:
+            ops = json.load(f)
+        if isinstance(ops, dict):
+            ops = ops.get("ops", ops)
+        res = apply(ops, dry_run="--yes" not in argv,
+                    stop_on_error="--keep-going" not in argv)
+        if res.get("backup"):
+            print(f"[已自动备份] {res['backup']['path']}", file=sys.stderr)
+        for r in res["report"]:
+            mark = {"applied": "改", "would-change": "会改", "no-change": "不动",
+                    "skipped": "跳过", "error": "出错"}.get(r["status"], r["status"])
+            print(f"{mark:4} {r['item']}")
+            for c in (r.get("changes") or []):
+                print(f"       {c.get('field')}: {c.get('from', '')!r} → {c.get('to', '')!r}")
+            if r.get("why"):
+                print(f"       ⚠ {r['why']}")
+            for cid in (r.get("collectionsLost") or []):
+                print(f"       ⚠ 丢了集合 {cid}（挂父级会静默摘掉，用 addToCollection 补回去）")
+            # 挂父级的第二重副作用，落在**另一个条目**上 —— 2026-09-12 踩到才知道要让差分盯着它
+            if r.get("wouldGiveParent"):
+                print(f"       ⚠ 演练：挂上去之后，{r.get('parentItem')} 会拿到集合 "
+                      f"{r['wouldGiveParent']}")
+            for cid in (r.get("parentCollectionsGained") or []):
+                print(f"       ⚠ 父条目 {r.get('parentItem')} 被塞进了集合 {cid}"
+                      f"（父子条目原有归属转过去的，用 removeFromCollection 摘掉）")
+                print(f"         父条目集合 {r.get('parentCollectionsBefore')} → "
+                      f"{r.get('parentCollectionsAfter')}")
+        print(f"\n改 {res['applied']} · 跳过 {res['skipped']} · 出错 {res['errors']}"
+              + ("（演练，未写入；确认后加 --yes）" if res["dryRun"] else ""), file=sys.stderr)
+        if res.get("warning"):
+            print(res["warning"], file=sys.stderr)
+    elif cmd == "backup":
+        res = backup()
+        print(f"已备份 {(res['bytes'] / 1048576):.1f} MB · {res['ms']} ms")
+        print(res["path"])
+        removed = res.get("removed") or []
+        # remaining 是轮转后的数，到上限时恒等于 kept —— 报轮转前有几份才有信息量。
+        if removed:
+            print(f"保留最近 {res['kept']} 份，这次删掉 {len(removed)} 份旧的"
+                  f"（备份前有 {res['kept'] + len(removed)} 份）", file=sys.stderr)
+            for n in removed:
+                print(f"[轮转删除] {n}", file=sys.stderr)
+        else:
+            print(f"保留最近 {res['kept']} 份，目录里现在 {res['remaining']} 份", file=sys.stderr)
     else:
         print(f"未知命令: {cmd}", file=sys.stderr)
         return 1

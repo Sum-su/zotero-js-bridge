@@ -1,11 +1,14 @@
 /* Zotero JS Bridge
  *
- * 在 Zotero 自带的 127.0.0.1 HTTP 服务器（默认 23119）上挂四个端点：
+ * 在 Zotero 自带的 127.0.0.1 HTTP 服务器（默认 23119）上挂七个端点：
  *
- *   GET  /zoterojs/ping    健康检查，不需要 token
- *   POST /zoterojs/exec    执行任意 JS（支持顶层 await / return），需要 token
- *   POST /zoterojs/merge   带自检的条目合并（支持 dryRun），需要 token
- *   GET|POST /zoterojs/logs 读错误控制台 / 调试输出，需要 token
+ *   GET       /zoterojs/ping    健康检查，不需要 token
+ *   POST      /zoterojs/exec    执行任意 JS（支持顶层 await / return），需要 token
+ *   POST      /zoterojs/merge   带自检的条目合并（支持 dryRun），需要 token
+ *   GET|POST  /zoterojs/logs    读错误控制台 / 调试输出，需要 token
+ *   GET|POST  /zoterojs/query   结构化只读查询（不用写 SQL），需要 token
+ *   GET|POST  /zoterojs/doctor  库体检：孤儿目录、未归类、附件标题、重名附件…需要 token
+ *   POST      /zoterojs/apply   批量写（支持 dryRun）+ 集合归属前后差分，需要 token
  *
  * Token 首次启动生成并记在 pref 里，每次启动都写入 Zotero 数据目录下的
  * zoterojs-token.txt，外部程序读这个文件即可。
@@ -25,8 +28,12 @@ const PREF_TOKEN = "jsbridge.token";          // → extensions.zotero.jsbridge.
 const PREF_ENABLED = "jsbridge.enabled";
 const PREF_READONLY = "jsbridge.readonly";
 const PREF_RESPONSE_KB = "jsbridge.limit.responseKB";
+const PREF_BACKUP = "jsbridge.backup.enabled";
+const PREF_BACKUP_KEEP = "jsbridge.backup.keep";
 const TOKEN_FILE = "zoterojs-token.txt";
-const PATHS = ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs"];
+const BACKUP_DIR = "jsbridge-backups";
+const PATHS = ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs",
+  "/zoterojs/query", "/zoterojs/doctor", "/zoterojs/apply"];
 
 /* 每个端点一个开关。面板上勾掉哪个，哪个当场返回 404 —— 闸门在请求路径上现读 pref，
  * 所以改完立刻生效，既不用重启也不用重新注册端点。 */
@@ -35,6 +42,9 @@ const PREF_EP = {
   "/zoterojs/exec": "jsbridge.endpoint.exec",
   "/zoterojs/merge": "jsbridge.endpoint.merge",
   "/zoterojs/logs": "jsbridge.endpoint.logs",
+  "/zoterojs/query": "jsbridge.endpoint.query",
+  "/zoterojs/doctor": "jsbridge.endpoint.doctor",
+  "/zoterojs/apply": "jsbridge.endpoint.apply",
 };
 
 /* 读 pref 的三条规矩（都踩过）：
@@ -492,15 +502,33 @@ function describeMsg(m) {
 /* 参数既能从 GET 的 searchParams 来，也能从 POST 的 JSON body 来。
  * server.js:479 的 options 是 {method, pathname, pathParams, searchParams, headers, data}，
  * GET 走的是 data = null，所以查询串必须从 searchParams 读。 */
+// GET 过来的参数**全都是字符串**，`where=[{...}]` 这种带结构的参数用 GET 根本传不进来
+// （curl 和 zoterojs.py 都是 GET）。所以在这一层统一解一次：看着像数组/对象的才解，
+// 解不出来就原样当字符串 —— 别把 "2022" 变成数字，"0012" 那种前导零会被吃掉。
+function decodeParam(v) {
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (s[0] !== "[" && s[0] !== "{") return v;
+  try { return JSON.parse(s); } catch (e) { return v; }
+}
+
 function readParams(options) {
   const out = {};
   try {
     const sp = options && options.searchParams;
-    if (sp && typeof sp.forEach === "function") sp.forEach((v, k) => { out[k] = v; });
+    if (sp && typeof sp.forEach === "function") sp.forEach((v, k) => { out[k] = decodeParam(v); });
   } catch (e) { /* 没有查询串 */ }
   const d = options && options.data;
   if (d && typeof d === "object") for (const k of Object.keys(d)) out[k] = d[k];
   return out;
+}
+
+// 列表参数两种写法都收：JSON 数组（POST，以及 decodeParam 解出来的 GET），
+// 或者逗号分隔的字符串（`checks=sync,unfiled`）。命令行里后者好敲得多。
+function asList(v) {
+  if (Array.isArray(v)) return v.map(String).filter(Boolean);
+  if (typeof v === "string" && v.trim()) return v.split(",").map(s => s.trim()).filter(Boolean);
+  return null;
 }
 
 function asBool(v) {
@@ -578,6 +606,713 @@ async function readDebug() {
   return out;
 }
 
+/* ---------------- 备份 ---------------- */
+
+/* 用 VACUUM INTO，不用 Zotero.DB.backUpDatabase()：后者默认写 zotero.sqlite.bak
+ * 并且做轮转，可能把 .1.bak 那个唯一还原点覆盖掉。
+ *
+ * VACUUM INTO 实测（Zotero 10.0.2，52 MB 的库）：586 ms、不动 WAL、
+ * **目标已存在就直接报错拒写**，所以撞名不会静默盖掉上一份。
+ * 目标路径走绑定参数是可行的（不是字符串拼接）——省掉 Windows 反斜杠转义那一堆事。 */
+
+function backupDirPath() {
+  try { return PathUtils.join(Zotero.DataDirectory.dir, BACKUP_DIR); }
+  catch (e) { return Zotero.DataDirectory.dir + "\\" + BACKUP_DIR; }
+}
+
+async function listBackups() {
+  try {
+    const kids = await IOUtils.getChildren(backupDirPath());
+    return kids.map(p => PathUtils.filename(p))
+      .filter(n => n && n.endsWith(".sqlite"))
+      .sort();                      // 文件名以 ISO 时间戳开头，字典序就是时间序
+  } catch (e) { return []; }        // 目录还不存在
+}
+
+async function rotateBackups(keep) {
+  const all = await listBackups();
+  const dead = all.slice(0, Math.max(0, all.length - keep));
+  const removed = [];
+  for (const n of dead) {
+    try {
+      await IOUtils.remove(PathUtils.join(backupDirPath(), n));
+      removed.push(n);
+    } catch (e) { logErr(e); }
+  }
+  return removed;
+}
+
+// 撞名时往后加序号，而不是让 VACUUM INTO 报错 —— 同一毫秒内连备两次虽然不常见，
+// 但自动备份是挂在写操作上的，连着来两条命令就会撞上。
+async function freeBackupPath(stamp) {
+  for (let i = 1; i < 100; i++) {
+    const name = `zotero-${stamp}${i === 1 ? "" : "-" + i}.sqlite`;
+    const p = PathUtils.join(backupDirPath(), name);
+    let exists = false;
+    try { exists = await IOUtils.exists(p); } catch (e) { /* 查不到就试写 */ }
+    if (!exists) return p;
+  }
+  throw new Error("同名备份太多，先清一下 " + backupDirPath());
+}
+
+async function doBackup() {
+  const dir = backupDirPath();
+  await IOUtils.makeDirectory(dir, { ignoreExisting: true, createAncestors: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = await freeBackupPath(stamp);
+  const t0 = Date.now();
+  await Zotero.DB.queryAsync("VACUUM INTO ?", [dest]);
+  let bytes = 0;
+  try { bytes = (await IOUtils.stat(dest)).size; } catch (e) { logErr(e); }
+  const keep = prefInt(PREF_BACKUP_KEEP, 5, 1, 200);
+  const removed = await rotateBackups(keep);
+  return {
+    path: dest,
+    bytes,
+    ms: Date.now() - t0,
+    kept: keep,
+    removed,
+    remaining: (await listBackups()).length,
+  };
+}
+
+/* 自动备份挂在写操作上。备份失败就**不写** —— 用户专门打开这个开关就是为了有个兜底，
+ * 兜不住还照写，等于把这个开关变成一句安慰话。 */
+async function backupBefore(tag) {
+  if (!prefBool(PREF_BACKUP, false)) return null;
+  try {
+    const b = await doBackup();
+    b.reason = tag;
+    return b;
+  } catch (e) {
+    throw new Error(`自动备份失败（${tag}），本次写操作已中止：` + String(e.message || e) +
+      `\n备份开关：extensions.zotero.${PREF_BACKUP}`);
+  }
+}
+
+/* ---------------- 结构化查询 ---------------- */
+
+/* 目的不是"再做一个 SQL 壳"，而是**让调用方不用写 SQL**——那三类坑
+ * （LIKE 必须带绑定、字符串里不能有字面问号、全角字符会炸解析器）全在 SQL 那一层，
+ * 走 Zotero 自己的 Search 就一个都碰不到。
+ *
+ * 条件名和算符不猜：拿 Zotero.SearchConditions 现查现验，不认识就报 400 并把
+ * 可选的面列出来。查的是真源码里的那张表（searchConditions.js），不是文档。 */
+
+const QUERY_SHORTHAND = {
+  title: "title", doi: "DOI", isbn: "ISBN", creator: "creator", author: "creator",
+  collection: "collection", tag: "tag", itemType: "itemType", type: "itemType",
+  key: "key", abstract: "abstractNote", journal: "publicationTitle",
+  q: "titleCreatorYear", text: "fulltextContent", year: "year",
+};
+
+function conditionOps(field) {
+  try {
+    const c = Zotero.SearchConditions.get(field);
+    return c && c.operators ? Object.keys(c.operators) : null;
+  } catch (e) { return null; }
+}
+
+// 简写默认用 contains（"查得到"比"一模一样"常用得多），但 is / true 这类要显式给的
+// 条件给个好默认值。
+function defaultOp(field) {
+  const ops = conditionOps(field) || [];
+  if (ops.indexOf("contains") >= 0) return "contains";
+  if (ops.indexOf("is") >= 0) return "is";
+  if (ops.indexOf("true") >= 0) return "true";
+  return ops[0];
+}
+
+function buildConditions(p) {
+  const out = [];
+  const bad = [];
+  const push = (field, op, value) => {
+    const ops = conditionOps(field);
+    if (!ops) { bad.push(`未知条件 ${field}`); return; }
+    const o = op || defaultOp(field);
+    if (ops.indexOf(o) < 0) { bad.push(`${field} 不支持算符 ${o}（可用：${ops.join(" / ")}）`); return; }
+    out.push([field, o, value]);
+  };
+
+  for (const k of Object.keys(QUERY_SHORTHAND)) {
+    if (p[k] === undefined || p[k] === null || p[k] === "") continue;
+    push(QUERY_SHORTHAND[k], p[k + "Op"], p[k]);
+  }
+  const where = Array.isArray(p.where) ? p.where : [];
+  for (const w of where) {
+    if (!w || !w.field) { bad.push("where 里有一项没写 field"); continue; }
+    push(String(w.field), w.op, w.value);
+  }
+  if (asBool(p.unfiled) || String(p.unfiled || "").toLowerCase() === "true") {
+    push("unfiled", "true", true);
+  }
+  return { conditions: out, bad };
+}
+
+async function collectionsBrief(ids) {
+  const out = {};
+  if (!ids.length) return out;
+  const marks = ids.map(() => "?").join(",");
+  const rows = await Zotero.DB.queryAsync(
+    `SELECT ci.itemID AS itemID, c.collectionID AS cid, c.collectionName AS name, c.key AS ckey
+     FROM collectionItems ci JOIN collections c ON c.collectionID = ci.collectionID
+     WHERE ci.itemID IN (${marks})`, ids);
+  for (const r of rows || []) {
+    (out[r.itemID] = out[r.itemID] || []).push({ key: r.ckey, name: r.name });
+  }
+  return out;
+}
+
+function creatorLine(c) {
+  if (c.fieldMode === 1) return String(c.lastName || "");
+  return [c.lastName, c.firstName].filter(Boolean).join(" ");
+}
+
+async function doQuery(p) {
+  const { conditions, bad } = buildConditions(p);
+  if (bad.length) {
+    return { error: bad.join("；") + "\n可用条件见 Zotero.SearchConditions.getStandardConditions()，" +
+      "常用的：title / DOI / ISBN / creator / collection / tag / itemType / anyField / q（标题+作者+年份）" };
+  }
+  if (!conditions.length) {
+    return { error: "没给查询条件。至少要有一个（title / doi / creator / collection / tag / where）" };
+  }
+
+  const s = new Zotero.Search();
+  s.libraryID = Zotero.Libraries.userLibraryID;
+  for (const [f, o, v] of conditions) {
+    // 集合用 key 还是名字都能给：key 是 8 位且库里认得出来才当 key，否则当名字
+    s.addCondition(f, o, v);
+  }
+  let ids = [];
+  try { ids = await s.search(); }
+  catch (e) { return { error: "搜索失败: " + String(e.message || e), conditions }; }
+
+  const limit = asInt(p.limit, 50, 1, 500);
+  const total = ids.length;
+  const shown = ids.slice(0, limit);
+  const items = (await Zotero.Items.getAsync(shown) || []).filter(Boolean);
+  const wantCols = p.includeCollections === undefined || asBool(p.includeCollections);
+  const cols = wantCols ? await collectionsBrief(shown) : {};
+
+  // 父条目一次批量查出来，别在循环里一条条 get
+  const parents = items.map(it => it.parentItemID).filter(Boolean);
+  const parentKeys = {};
+  if (parents.length) {
+    for (const p of (await Zotero.Items.getAsync([...new Set(parents)]) || [])) {
+      if (p) parentKeys[p.itemID] = p.key;
+    }
+  }
+
+  const fields = asList(p.fields) || [];
+  const out = items.map(it => {
+    const o = {
+      key: it.key,
+      itemID: it.itemID,
+      itemType: Zotero.ItemTypes.getName(it.itemTypeID),
+      title: it.getField("title"),
+      date: it.getField("date"),
+      creators: it.getCreators().map(creatorLine).filter(Boolean),
+      inTrash: !!it.deleted,
+    };
+    if (it.parentItemID) o.parent = parentKeys[it.parentItemID] || it.parentItemID;
+    for (const f of fields) {
+      try { o[f] = it.getField(f); } catch (e) { o[f] = "[没有这个字段]"; }
+    }
+    if (wantCols) o.collections = cols[it.itemID] || [];
+    return o;
+  });
+
+  const res = { ok: true, total, returned: out.length, items: out, conditions };
+  if (total > out.length) {
+    res.omitted = total - out.length;
+    res.hint = `命中 ${total} 条，只回了前 ${out.length} 条（limit）。` +
+      `items[].key 可以直接喂给 merge / apply。`;
+  }
+  return res;
+}
+
+/* ---------------- 库体检 ---------------- */
+
+/* 检查项都是这台机器上真踩过的坑，判据照抄 docs/07 和 docs/08 —— 不是凭空想的规则。 */
+
+const DOCTOR_CHECKS = ["orphanStorage", "unfiled", "attachmentTitle",
+  "duplicateFilenames", "duplicates", "trashWriteback", "sync"];
+
+// 默认只跑本地检查。sync 要连 zotero.org，藏在一个"体检"按钮后面不合适 —— 想要就点名要。
+const DOCTOR_DEFAULT = DOCTOR_CHECKS.filter(c => c !== "sync");
+
+async function checkOrphanStorage() {
+  const live = new Set(await Zotero.DB.columnQueryAsync(
+    "SELECT key FROM items WHERE itemID IN (SELECT itemID FROM itemAttachments)") || []);
+  const dir = PathUtils.join(Zotero.DataDirectory.dir, "storage");
+  let kids = [];
+  try { kids = await IOUtils.getChildren(dir); } catch (e) { return { error: String(e.message || e) }; }
+  const dirs = kids.map(p => PathUtils.filename(p)).filter(n => n && n.length === 8);
+  const orphans = dirs.filter(n => !live.has(n));
+  return {
+    count: orphans.length,
+    scanned: dirs.length,
+    sample: orphans.slice(0, 20),
+    note: "孤儿目录 = storage/ 下有、items 表里没有对应附件。这个数**只增不减**是正常的：" +
+      "历史遗留会一直留着。要看的是**本次操作前后有没有变多**，别把基数当故障。",
+  };
+}
+
+async function checkUnfiled() {
+  // 官方口径的"未分类"，别自己写 SQL 定义（annotation 是独立 itemType，
+  // 只排除 attachment + note 会把上万条批注算进去）
+  const s = new Zotero.Search();
+  s.libraryID = Zotero.Libraries.userLibraryID;
+  s.addCondition("unfiled", "true");
+  const ids = await s.search();
+  const brief = await collectionsBrief(ids.slice(0, 20));
+  return { count: ids.length, sample: await keysOf(ids.slice(0, 20)), _cols: brief };
+}
+
+async function keysOf(ids) {
+  const items = await Zotero.Items.getAsync(ids);
+  return (items || []).filter(Boolean).map(it => ({ key: it.key, title: it.getField("title") }));
+}
+
+async function checkAttachmentTitle(p) {
+  const attType = Zotero.ItemTypes.getID("attachment");
+  const titleField = Zotero.ItemFields.getID("title");
+  // attachmentFilename 是 Zotero 自己的取文件名方式，path 里带 "storage:" 前缀要剥掉
+  const rows = await Zotero.DB.queryAsync(
+    `SELECT i.itemID AS itemID, i.key AS key, idv.value AS title, ia.path AS path
+     FROM itemAttachments ia
+     JOIN items i ON i.itemID = ia.itemID
+     LEFT JOIN itemData id ON id.itemID = i.itemID AND id.fieldID = ?
+     LEFT JOIN itemDataValues idv ON idv.valueID = id.valueID
+     WHERE i.itemTypeID = ? AND ia.path IS NOT NULL AND ia.path LIKE ?`,
+    [titleField, attType, "storage:%"]);
+
+  const defaults = (asList(p.titles) || ["Full Text PDF"]).map(t => String(t).toLowerCase());
+  const flagged = [], mismatch = [], empty = [];
+  for (const r of rows || []) {
+    const file = String(r.path || "").replace(/^storage:/, "");
+    const base = file.replace(/\.[^.]+$/, "");
+    const title = String(r.title || "");
+    if (!title.trim()) { empty.push({ key: r.key, file }); continue; }
+    if (defaults.indexOf(title.toLowerCase()) >= 0) {
+      flagged.push({ key: r.key, title, file });
+      continue;
+    }
+    // 标题和文件名对得上就算一致。**两种形态都得认**：Zotero 给独立附件存的标题是
+    // 带扩展名的完整文件名，而重命名过的往往只剩主名。只把文件名那一边的扩展名剥掉
+    // （原来的写法）会把 721 条本来就一致的判成不一致 —— 实测这个库有 721 条是
+    // title === 完整文件名，剥完就成了 789 条"不一致"，全是假的。
+    const t = strip(title);
+    if (t !== strip(file) && t !== strip(base)) mismatch.push({ key: r.key, title, file });
+  }
+  return {
+    count: flagged.length,
+    sample: flagged.slice(0, 20),
+    emptyCount: empty.length,
+    emptySample: empty.slice(0, 10),
+    mismatchCount: mismatch.length,
+    mismatchSample: mismatch.slice(0, 10),
+    note: "三个数说的不是一回事，别混着看：\n" +
+      "count = 标题停在导入器默认值（默认认「Full Text PDF」，可用 titles 换）—— 这个要修；\n" +
+      "emptyCount = 标题是空的 —— 也要修，而且修起来最省事；\n" +
+      "mismatchCount = 标题和文件名两边都对不上（两种形态都算过）。" +
+      "这个库里独占 PDF 的父条目本来就该显示成「PDF」，所以**这个数偏大是正常的**；" +
+      "要动就只在界面上走批量重命名，别脚本硬写文件名。",
+  };
+}
+
+async function checkDuplicateFilenames() {
+  const attType = Zotero.ItemTypes.getID("attachment");
+  const rows = await Zotero.DB.queryAsync(
+    `SELECT ia.parentItemID AS parent, ia.path AS path, i.key AS key
+     FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID
+     WHERE i.itemTypeID = ? AND ia.parentItemID IS NOT NULL
+       AND ia.path IS NOT NULL AND ia.path LIKE ?`, [attType, "storage:%"]);
+  // 两级 map，不拼分隔符：文件名里什么字符都可能有，拼字符串迟早撞上
+  const byParent = {};
+  for (const r of rows || []) {
+    const file = String(r.path || "").replace(/^storage:/, "");
+    const per = byParent[r.parent] = byParent[r.parent] || {};
+    const k = file.toLowerCase();
+    (per[k] = per[k] || []).push({ key: r.key, file, parent: r.parent });
+  }
+  const clashes = [];
+  for (const per of Object.values(byParent)) {
+    for (const g of Object.values(per)) if (g.length > 1) clashes.push(g);
+  }
+  return {
+    count: clashes.length,
+    sample: clashes.slice(0, 10),
+    note: "同一个父条目下有两个**完全同名**的附件。" +
+      "典型来源是 pdf2zh 输出 xxx-mono.pdf / xxx-dual.pdf 之后被 Zotero 的自动重命名" +
+      "统一改成了「作者 - 年 - 标题.pdf」。修法是给译文加后缀（文件 + 标题都要）。",
+  };
+}
+
+async function checkDuplicates() {
+  const out = {};
+  for (const f of ["DOI", "ISBN"]) {
+    const fid = Zotero.ItemFields.getID(f);
+    if (!fid) continue;
+    const rows = await Zotero.DB.queryAsync(
+      `SELECT idv.value AS v, COUNT(*) AS n
+       FROM itemData id
+       JOIN itemDataValues idv ON idv.valueID = id.valueID
+       JOIN items i ON i.itemID = id.itemID
+       WHERE id.fieldID = ?
+         AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
+         AND i.itemTypeID NOT IN (SELECT itemTypeID FROM itemTypes
+                                  WHERE typeName IN ('attachment','note','annotation'))
+         AND idv.value IS NOT NULL AND idv.value <> ''
+       GROUP BY idv.value HAVING COUNT(*) > 1
+       ORDER BY COUNT(*) DESC LIMIT 50`, [fid]);
+    const groups = [];
+    for (const r of rows || []) {
+      const ids = await Zotero.DB.columnQueryAsync(
+        `SELECT id.itemID FROM itemData id JOIN itemDataValues idv ON idv.valueID = id.valueID
+         WHERE id.fieldID = ? AND idv.value = ?`, [fid, r.v]);
+      groups.push({ value: r.v, count: r.n, keys: await keysOf(ids || []) });
+    }
+    out[f.toLowerCase()] = { groups: groups.length, sample: groups.slice(0, 5) };
+  }
+  out.note = "只按 DOI / ISBN 分组，**这是线索不是判决**：" +
+    "同一教材上下册 ISBN 不同不算重复，网络首发版页号不同也不算。" +
+    "真要合并先跑 merge 的 dryRun，让自检说话。";
+  return out;
+}
+
+async function checkTrashWriteback(days) {
+  const since = new Date(Date.now() - days * 86400000).toISOString().replace("T", " ").slice(0, 19);
+  const rows = await Zotero.DB.queryAsync(
+    `SELECT i.itemID AS itemID, i.key AS key, i.dateModified AS dateModified
+     FROM items i
+     WHERE i.itemID IN (SELECT itemID FROM deletedItems) AND i.dateModified >= ?
+     ORDER BY i.dateModified DESC LIMIT 50`, [since]);
+  const total = await Zotero.DB.valueQueryAsync(
+    "SELECT COUNT(*) FROM deletedItems") || 0;
+
+  const out = {
+    trashTotal: total,
+    recentlyModified: (rows || []).length,
+    sample: (rows || []).map(r => ({ key: r.key, dateModified: r.dateModified })),
+    windowDays: days,
+  };
+  // 话随事实走。回收站空着的时候还硬讲一遍「里面有插件私有数据」，是在拿一段
+  // 写死的经历冒充当前状态 —— 2026-09-11 确实有一条（Ethereal Style 那套，
+  // 27055，正躺在回收站里却仍在被写入），2026-09-12 再查回收站已经是空的、
+  // 四个容器都活着。所以按查到的说。
+  if (!total) {
+    out.note = "回收站现在是空的。这条检查只在回收站里真有条目时才有话可说 —— " +
+      "空的时候不必担心，也别特意去翻。";
+  } else if (out.recentlyModified) {
+    out.note = `回收站里有 ${out.recentlyModified} 条在最近 ${days} 天还被改写 —— ` +
+      "有插件把它当私有数据库用了（Chartero 的阅读历史、Ethereal Style 的阅读进度都是这种）。" +
+      "**别清空回收站**：那些条目还在被写，清掉等于删掉那个插件的存储，而且不可恢复。" +
+      "要动它们先看清 key 属于谁。";
+  } else {
+    out.note = `回收站里有 ${total} 条，但最近 ${days} 天都没被改写。` +
+      "清空前仍然值得先看一眼它们是谁 —— 插件私有条目会伪装成普通条目。";
+  }
+  return out;
+}
+
+/* 这一项**要连 zotero.org**，所以默认不跑。API 三个都在真机上点过名
+ * （getLastSyncTime / getAPIKey / _libraryHasUnsyncedData 都是 Zotero.Sync.Data.Local
+ * 的**自有属性**，不是原型方法），userID 用 Zotero.Users.getCurrentUserID()。 */
+async function checkSync() {
+  const D = Zotero.Sync.Data.Local;
+  const out = {};
+  try {
+    const t = await D.getLastSyncTime();
+    out.lastSync = t instanceof Date ? t.toISOString() : String(t);
+  } catch (e) { out.lastSyncError = String(e.message || e); }
+  try { out.hasUnsyncedData = await D._libraryHasUnsyncedData(1); }
+  catch (e) { out.unsyncedError = String(e.message || e); }
+
+  try {
+    const local = await Zotero.DB.valueQueryAsync("SELECT MAX(version) FROM syncCache");
+    out.localVersion = Number(local);
+    const uid = Zotero.Users.getCurrentUserID();
+    const key = await D.getAPIKey();
+    if (!uid || !key) { out.note = "没登录，跳过服务器版本比对"; return out; }
+
+    const r = await Zotero.HTTP.request("GET",
+      `https://api.zotero.org/users/${uid}/items?limit=1&format=json`,
+      { headers: { "Zotero-API-Key": key, "Zotero-API-Version": "3" }, responseType: "text" });
+    const server = parseInt(r.getResponseHeader("Last-Modified-Version"), 10);
+    out.serverVersion = server;
+    out.inSync = out.localVersion === server;
+    if (!out.inSync) {
+      out.note = server > out.localVersion
+        ? `服务器 ${server} > 本机 ${out.localVersion} —— 本机没下全，同步一下`
+        : `本机 ${out.localVersion} > 服务器 ${server} —— 有东西还没传上去`;
+    }
+  } catch (e) { out.networkError = String(e.message || e); }
+  return out;
+}
+
+async function doDoctor(p) {
+  let want = asList(p.checks);
+  if (asBool(p.all)) want = DOCTOR_CHECKS.slice();
+  if (!want) want = DOCTOR_DEFAULT.slice();
+  const unknown = want.filter(c => DOCTOR_CHECKS.indexOf(c) < 0);
+  if (unknown.length) {
+    return { error: `未知检查项 ${unknown.join("、")}；可用：${DOCTOR_CHECKS.join(" / ")}` };
+  }
+
+  const t0 = Date.now();
+  const out = { ok: true, checks: {}, ran: want };
+  for (const c of want) {
+    try {
+      if (c === "orphanStorage") out.checks[c] = await checkOrphanStorage();
+      else if (c === "unfiled") out.checks[c] = await checkUnfiled();
+      else if (c === "attachmentTitle") out.checks[c] = await checkAttachmentTitle(p);
+      else if (c === "duplicateFilenames") out.checks[c] = await checkDuplicateFilenames();
+      else if (c === "duplicates") out.checks[c] = await checkDuplicates();
+      else if (c === "trashWriteback") {
+        out.checks[c] = await checkTrashWriteback(asInt(p.days, 30, 1, 3650));
+      }
+      else if (c === "sync") out.checks[c] = await checkSync();
+    } catch (e) {
+      out.checks[c] = { error: String(e.message || e) };
+    }
+  }
+  out.ms = Date.now() - t0;
+  out.note = "体检**只读**，不改任何东西。没点名的检查没跑：" +
+    "sync 要连 zotero.org，默认不跑，要的话传 {checks:[\"sync\"]} 或 {all:true}。";
+  return out;
+}
+
+/* ---------------- 批量写：apply ---------------- */
+
+/* 这个端点存在的唯一理由是**自动做那件总是忘记做的事**：
+ * 把条目挂成子条目（设 parentItemID）会**静默摘掉它的集合归属**，
+ * 而"说完回头查 collectionItems"是靠人记的，靠不住。
+ *
+ * ⚠️ 2026-09-12 更正：这里原先把 setType() 也列成会摘集合的一种，**那是错的**。
+ * 真机上 presentation → document → presentation 走一遍，collectionItems 一行没动；
+ * 读源码也对得上（item.js 的 setType 只碰 itemData / creators）。摘集合的是
+ * collectionItems 上那条数据库触发器 —— 集合里不许有"有父级的条目"。
+ *
+ * 差分不看内存缓存。saveTx() 之后立刻读 it.getCollections() 可能还是旧值，所以直接查表。 */
+
+async function collectionsOf(itemID) {
+  try {
+    const rows = await Zotero.DB.columnQueryAsync(
+      "SELECT collectionID FROM collectionItems WHERE itemID=?", [itemID]);
+    return (rows || []).map(Number).sort((a, b) => a - b);
+  } catch (e) { return []; }
+}
+
+function asKeyList(v) {
+  if (v === undefined || v === null || v === "") return [];
+  return (Array.isArray(v) ? v : [v]).map(String).filter(Boolean);
+}
+
+async function resolveCollection(key) {
+  const libID = Zotero.Libraries.userLibraryID;
+  return Zotero.Collections.getByLibraryAndKey(libID, String(key));
+}
+
+/* Zotero 的 Collection 对象上主键叫 **`.id`**，不叫 `collectionID` —— 后者是数据库列名。
+ * 两套名字混用是这插件最容易踩的一类坑（pref 的短名/全长、条目类型的名字/ID 都是同一类）。
+ *
+ * ⚠️ 这里是 2026-09-12 在真库上实测才抓出来的：写成 `c.collectionID` 时它是 `undefined`，
+ * 于是 `item.addToCollection(undefined)` → Zotero 抛 `Invalid collection 'undefined'`，
+ * **addToCollection / removeFromCollection 两个操作在真机上从来没成功过**。
+ * 单测没抓住，是因为 stub 里的集合对象是我自己捏的 `{collectionID, collectionName}`，
+ * 而真对象是 `{id, name, key, libraryID}` —— **stub 的形状错了，测试就只是在自我印证**。
+ * 现在 stub 照真形状来，并且对非数字 ID 同样抛错。 */
+function collectionIdOf(c) {
+  const cid = c.id;
+  if (typeof cid !== "number") {
+    throw new Error(`集合对象上没有数字 id（拿到了 ${JSON.stringify(cid)}）—— ` +
+      `Zotero 的 Collection 对象用 .id，只有数据库列才叫 collectionID`);
+  }
+  return cid;
+}
+
+// 字符串形式的创建者按**单字段模式**处理：中文名交给 Zotero 拆会被按"首字为姓"硬拆
+// （"朱其志" → 姓朱 / 名其志）。要拆的名字自己写成对象。
+function normalizeCreator(c) {
+  if (typeof c === "string") {
+    return { creatorType: "author", fieldMode: 1, lastName: c };
+  }
+  const o = Object.assign({}, c);
+  if (o.creatorType === undefined) o.creatorType = o.creatorTypeID === 8 ? "author" : "author";
+  return o;
+}
+
+async function applyOne(item, op, dryRun) {
+  const changes = [];
+  // 结构性改动：挂父级会静默摘集合，所以这里记下来给差分用（setType 不会，见 doApply 上面那段）
+  if (op.set && typeof op.set === "object") {
+    for (const f of Object.keys(op.set)) {
+      let before;
+      try { before = item.getField(f); } catch (e) { before = "[没有这个字段]"; }
+      const after = op.set[f];
+      if (String(before) !== String(after)) {
+        changes.push({ field: f, from: before, to: after });
+        if (!dryRun) item.setField(f, after);
+      }
+    }
+  }
+  if (op.setCreators && Array.isArray(op.setCreators)) {
+    const cs = op.setCreators.map(normalizeCreator);
+    changes.push({ field: "creators", from: item.getCreators().map(creatorLine), to: cs.map(creatorLine) });
+    if (!dryRun) item.setCreators(cs);
+  }
+  if (op.setType) {
+    const tid = typeof op.setType === "number" ? op.setType : Zotero.ItemTypes.getID(String(op.setType));
+    if (!tid) throw new Error(`未知条目类型 ${op.setType}`);
+    changes.push({ field: "itemType", from: item.itemType, to: Zotero.ItemTypes.getName(tid) });
+    if (!dryRun) item.setType(tid);
+  }
+  if (op.parent !== undefined) {
+    const pk = op.parent === null ? null : String(op.parent);
+    let pid = null;
+    if (pk) {
+      const par = await getItem(Zotero.Libraries.userLibraryID, pk);
+      if (!par) throw new Error(`父条目 ${pk} 不存在`);
+      pid = par.itemID;
+    }
+    changes.push({ field: "parentItemID", from: item.parentItemID || null, to: pid });
+    if (!dryRun) item.parentItemID = pid;
+  }
+  for (const k of asKeyList(op.addToCollection)) {
+    const c = await resolveCollection(k);
+    if (!c) throw new Error(`集合 ${k} 不存在`);
+    const cid = collectionIdOf(c);
+    changes.push({ field: "addToCollection", to: c.name, collectionID: cid });
+    if (!dryRun) item.addToCollection(cid);
+  }
+  for (const k of asKeyList(op.removeFromCollection)) {
+    const c = await resolveCollection(k);
+    if (!c) throw new Error(`集合 ${k} 不存在`);
+    const cid = collectionIdOf(c);
+    changes.push({ field: "removeFromCollection", to: c.name, collectionID: cid });
+    if (!dryRun) item.removeFromCollection(cid);
+  }
+  return changes;
+}
+
+async function doApply(p) {
+  const ops = Array.isArray(p.ops) ? p.ops : [];
+  if (!ops.length) return { error: "需要 {ops: [{item: 'KEY', set: {...}}, ...]}" };
+  const dryRun = !!p.dryRun;
+  const libID = Zotero.Libraries.userLibraryID;
+  const stoppedOnError = p.stopOnError === undefined ? true : asBool(p.stopOnError);
+
+  let backup = null;
+  if (!dryRun) backup = await backupBefore("apply");
+
+  const report = [];
+  for (const op of ops) {
+    const key = String(op.item || op.key || "");
+    const rec = { item: key };
+    try {
+      const item = await getItem(libID, key);
+      if (!item) { report.push(Object.assign(rec, { status: "error", why: "条目不存在" })); if (stoppedOnError) break; continue; }
+
+      // expect：改之前先读原值比对，不符就跳过 —— 别对着错误的条目动手
+      const expect = op.expect && typeof op.expect === "object" ? op.expect : null;
+      if (expect) {
+        const bad = Object.keys(expect).filter(f => String(item.getField(f)) !== String(expect[f]));
+        if (bad.length) {
+          report.push(Object.assign(rec, {
+            status: "skipped", why: "原值与 expect 不符",
+            mismatch: bad.map(f => ({ field: f, want: expect[f], got: item.getField(f) })),
+          }));
+          continue;
+        }
+      }
+
+      const before = await collectionsOf(item.itemID);
+      /* 挂父级有**第二重**副作用，而且落在**另一个条目**上：Zotero 把子条目原有的集合
+       * 归属整个转给父条目（item.js:1944-1967，注释原文 "remove from any collections
+       * where it existed previously and add parent instead"）。
+       *
+       * ⚠️ 2026-09-12 在真库上踩到才知道要让差分盯着父条目：把集合 307 里的裸附件
+       * 4WWZ44HC 挂到 X3DGSJ99 名下，附件那半边差分报得好好的（collectionsLost:[307]），
+       * 而**父条目被凭空加进了 307，报告里一个字都没有** —— 这恰恰是这个端点要防的那种
+       * 静默改动，只是以前只盯着被写的那一个条目。
+       * 更难发现的是父条目的 save() 带 skipDateModifiedUpdate，dateModified 不变，
+       * 事后想靠"最近改过哪些条目"倒查都查不出来。 */
+      let watched = null;
+      if (op.parent) {
+        const par = await getItem(libID, String(op.parent));
+        if (par) watched = { itemID: par.itemID, key: par.key, before: await collectionsOf(par.itemID) };
+      }
+      const changes = await applyOne(item, op, dryRun);
+
+      if (dryRun) {
+        const extra = {};
+        // 预测：子条目现在的集合，挂上去之后就归父条目了（真机就是这么搬的）
+        if (watched) {
+          extra.wouldGiveParent = before;
+          extra.parentItem = watched.key;
+        }
+        report.push(Object.assign(rec, {
+          status: changes.length ? "would-change" : "no-change",
+          changes, collections: before,
+        }, extra));
+        continue;
+      }
+
+      if (!changes.length) { report.push(Object.assign(rec, { status: "no-change" })); continue; }
+      await item.saveTx();
+
+      const after = await collectionsOf(item.itemID);
+      // 这个 op 自己要求的摘除不算"意外丢失"
+      const intended = new Set(changes.filter(c => c.field === "removeFromCollection")
+        .map(c => c.collectionID));
+      const lost = before.filter(c => after.indexOf(c) < 0 && !intended.has(c));
+      const rec2 = { status: "applied", changes, collectionsBefore: before, collectionsAfter: after };
+      if (lost.length) {
+        rec2.collectionsLost = lost;
+        rec2.why = "有个条目被**静默摘掉了集合归属** —— 它被挂成了别人的子条目，" +
+          "而集合里不许有子条目（collectionItems 上的数据库触发器）。";
+      }
+      if (watched) {
+        const pAfter = await collectionsOf(watched.itemID);
+        const gained = pAfter.filter(c => watched.before.indexOf(c) < 0);
+        if (gained.length) {
+          rec2.parentItem = watched.key;
+          rec2.parentCollectionsBefore = watched.before;
+          rec2.parentCollectionsAfter = pAfter;
+          rec2.parentCollectionsGained = gained;
+        }
+      }
+      report.push(Object.assign(rec, rec2));
+    } catch (e) {
+      report.push(Object.assign(rec, { status: "error", why: String(e.message || e) }));
+      if (stoppedOnError) break;
+    }
+  }
+
+  const out = {
+    ok: true,
+    dryRun,
+    applied: report.filter(r => r.status === "applied").length,
+    skipped: report.filter(r => r.status === "skipped").length,
+    errors: report.filter(r => r.status === "error").length,
+    report,
+  };
+  if (backup) out.backup = backup;
+  const warns = [];
+  if (report.some(r => r.collectionsLost)) {
+    warns.push("有条目丢了集合归属，见各条的 collectionsLost —— **这不是报错，是 Zotero 的正常行为**，" +
+      "但它静默发生，所以必须补回去。");
+  }
+  if (report.some(r => r.parentCollectionsGained)) {
+    warns.push("**父条目**也中招了：挂父级会把子条目原有的集合归属转给父条目，" +
+      "见各条的 parentCollectionsGained —— 那多半不是你想要的，父条目自己不会退出那些集合。");
+  }
+  if (warns.length) out.warning = warns.join(" ");
+  return out;
+}
+
 /* ---------------- 管理面板 ---------------- */
 
 /* 面板是静态 XHTML 片段，够不着 bootstrap 作用域里的函数，所以把要用的几个挂到
@@ -630,11 +1365,41 @@ function buildPaneApi() {
       paneText(doc, "jsb-status", w.ok ? "已写入 " + w.path : "写文件失败：" + w.error);
     },
 
+    // 备份是**同步等**的：52 MB 的库约 0.6 秒，等得起。
+    // 期间界面不响应是正常的，别做成「后台跑着」—— 那样用户以为完事了其实没有。
+    //
+    // doc 可以不传。面板之外（zoterojs.py 的 backup 走 exec 调这个函数）拿不到 document，
+    // 而 paneText 对 null doc 是安全的。返回值带 ok，调用方才判断得了成败 ——
+    // 这里不抛：面板按钮的 oncommand 会把返回值丢掉，抛出去就变成一条没人管的
+    // unhandled rejection，只会在错误控制台里躺着。
+    async backupNow(doc) {
+      paneText(doc, "jsb-status", "正在备份…（库大的话要几秒，界面会卡住）");
+      try {
+        const b = await doBackup();
+        const mb = (b.bytes / 1048576).toFixed(1);
+        // remaining 是轮转**之后**的数，到上限时恒等于 kept，写成两个数看着像重复。
+        // 要报的是轮转前有几份，那才是"删掉了多少"的参照。
+        let msg = `已备份 ${mb} MB · ${b.ms} ms\n${b.path}\n保留最近 ${b.kept} 份`;
+        if (b.removed.length) {
+          msg += `，这次删掉 ${b.removed.length} 份旧的（备份前有 ${b.kept + b.removed.length} 份）`;
+        } else {
+          msg += `，目录里现在 ${b.remaining} 份`;
+        }
+        if (b.removed.length) msg += `\n轮转删掉了：\n  ` + b.removed.slice(-5).join("\n  ");
+        paneText(doc, "jsb-status", msg);
+        return Object.assign({ ok: true }, b);
+      } catch (e) {
+        const why = String(e.message || e);
+        paneText(doc, "jsb-status", "备份失败：" + why + "\n（目标目录 " + backupDirPath() + "）");
+        return { ok: false, error: why, dir: backupDirPath() };
+      }
+    },
+
     // 只做静态自检：注册表、pref、token 文件。发真实 HTTP 请求去测自己的话，
     // UA 会被 Zotero 自己的 CSRF 防护掐断，测出来的失败说明不了任何问题。
     async selfCheck(doc) {
       const lines = [`版本 ${addonVersion} · Zotero ${Zotero.version}`];
-      lines.push(`总开关：${prefBool(PREF_ENABLED, true) ? "开" : "关（四个端点全部停用）"}` +
+      lines.push(`总开关：${prefBool(PREF_ENABLED, true) ? "开" : "关（所有端点停用）"}` +
         `　只读模式：${prefBool(PREF_READONLY, false) ? "开（写入口被拒）" : "关"}`);
       for (const p of PATHS) {
         const on = prefBool(PREF_EP[p], true);
@@ -651,6 +1416,14 @@ function buildPaneApi() {
       lines.push(`　${token ? "✓" : "✗"} token ${token ? token.length + " 字符" : "为空"}` +
         `　${exists ? "✓" : "✗"} token 文件` +
         (exists ? "" : "（点上面的「重写 token 文件」）"));
+
+      // 备份状态也一并报出来：自动备份是个「开了就忘」的开关，
+      // 面板上不显示的话，用户没法知道它到底有没有在工作
+      const bs = await listBackups();
+      const auto = prefBool(PREF_BACKUP, false);
+      lines.push(`　${bs.length ? "✓" : "·"} 备份 ${bs.length} 份` +
+        `（自动备份：${auto ? "开，每次写操作前备一份" : "关"}）` +
+        (bs.length ? `\n　  最新：${bs[bs.length - 1]}` : "\n　  （点上面的「立即备份」建第一份）"));
       paneText(doc, "jsb-status", lines.join("\n"));
     },
   };
@@ -743,7 +1516,63 @@ const EP_MERGE = Ctor({
       return jsonReply(400, { ok: false, error: "需要 {master: 'KEY', dups: ['KEY', ...]}" });
     }
     try {
-      return pack(await doMerge(masterKey, dupKeys, !!data.dryRun));
+      const dryRun = !!data.dryRun;
+      // 自动备份只挂在真写之前。dry-run 不写，没必要备 —— 备份一份 52 MB 的库要 0.6 秒，
+      // 而 dry-run 是拿来反复试的。
+      const backup = dryRun ? null : await backupBefore("merge");
+      const out = await doMerge(masterKey, dupKeys, dryRun);
+      if (backup) out.backup = backup;
+      return pack(out);
+    } catch (e) {
+      return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
+    }
+  },
+});
+
+const EP_QUERY = Ctor({
+  supportedMethods: ["GET", "POST"],
+  supportedDataTypes: ["application/json"],
+  init: async function (options) {
+    const bad = checkAuth(options) || gate("/zoterojs/query", false);
+    if (bad) return bad;
+    try {
+      const out = await doQuery(readParams(options));
+      if (out.error) return jsonReply(400, { ok: false, error: out.error, conditions: out.conditions });
+      return pack(out);
+    } catch (e) {
+      return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
+    }
+  },
+});
+
+const EP_DOCTOR = Ctor({
+  supportedMethods: ["GET", "POST"],
+  supportedDataTypes: ["application/json"],
+  init: async function (options) {
+    const bad = checkAuth(options) || gate("/zoterojs/doctor", false);
+    if (bad) return bad;
+    try {
+      const out = await doDoctor(readParams(options));
+      if (out.error) return jsonReply(400, { ok: false, error: out.error });
+      return pack(out);
+    } catch (e) {
+      return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
+    }
+  },
+});
+
+const EP_APPLY = Ctor({
+  supportedMethods: ["POST"],
+  supportedDataTypes: ["application/json"],
+  init: async function (options) {
+    // 闸门按「写」算，**连 dryRun 也算**：dry-run 只是这一次不写，
+    // 但把写入口整个关掉的人（只读模式 / 端点开关）本来就不该看到这个端点通着。
+    const bad = checkAuth(options) || gate("/zoterojs/apply", true);
+    if (bad) return bad;
+    try {
+      const out = await doApply(options.data || {});
+      if (out.error) return jsonReply(400, { ok: false, error: out.error });
+      return pack(out);
     } catch (e) {
       return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
     }
@@ -817,6 +1646,9 @@ async function startup({ id, version, resourceURI, rootURI }, reason) {
     "/zoterojs/exec": EP_EXEC,
     "/zoterojs/merge": EP_MERGE,
     "/zoterojs/logs": EP_LOGS,
+    "/zoterojs/query": EP_QUERY,
+    "/zoterojs/doctor": EP_DOCTOR,
+    "/zoterojs/apply": EP_APPLY,
   };
   for (const path of Object.keys(epTable)) {
     const existing = Zotero.Server.Endpoints[path];

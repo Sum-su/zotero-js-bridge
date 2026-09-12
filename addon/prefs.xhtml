@@ -11,11 +11,11 @@
       <label>在 Zotero 进程内执行 JS 的本地端点。下面的开关<html:b>改完立刻生效</html:b>，不用重启 Zotero。</label>
       <checkbox id="jsb-enabled" native="true"
                 preference="extensions.zotero.jsbridge.enabled"
-                label="启用 JS Bridge（总开关，关掉后四个端点全部停用）"/>
+                label="启用 JS Bridge（总开关，关掉后所有端点停用）"/>
       <checkbox id="jsb-readonly" native="true"
                 preference="extensions.zotero.jsbridge.readonly"
-                label="只读模式（拒绝 exec / merge，以及 logs 的 clear）"/>
-      <label>只读模式不是沙箱，是拒绝服务：exec 能写出多少种副作用静态判不全，所以它不解析你的代码，而是把写入口整个关掉。读的口子（ping / logs）留着。</label>
+                label="只读模式（拒绝 exec / merge / apply，以及 logs 的 clear）"/>
+      <label>只读模式不是沙箱，是拒绝服务：exec 能写出多少种副作用静态判不全，所以它不解析你的代码，而是把写入口整个关掉。读的口子（ping / logs / query / doctor）留着。</label>
     </groupbox>
   </vbox>
 
@@ -34,7 +34,36 @@
       <checkbox id="jsb-ep-logs" native="true"
                 preference="extensions.zotero.jsbridge.endpoint.logs"
                 label="logs —— 读错误控制台 / 调试输出"/>
-      <label>关掉的端点会返回 404，并且在 ping 的 disabled 字段里列出来。</label>
+      <checkbox id="jsb-ep-query" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.query"
+                label="query —— 结构化查询（不用写 SQL）"/>
+      <checkbox id="jsb-ep-doctor" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.doctor"
+                label="doctor —— 一键库体检（只读）"/>
+      <checkbox id="jsb-ep-apply" native="true"
+                preference="extensions.zotero.jsbridge.endpoint.apply"
+                label="apply —— 批量改元数据（可写，自动报集合差分）"/>
+      <label>关掉的端点会返回 404，并且在 ping 的 disabled 字段里列出来。只读模式下 exec / merge / apply 回 403。</label>
+    </groupbox>
+  </vbox>
+
+  <vbox class="pref-section">
+    <groupbox>
+      <label><html:h2>备份</html:h2></label>
+      <label>备份用 SQLite 的 VACUUM INTO，写一份干净的单文件副本，不动正在用的库。文件名带时间戳，放数据目录下的 jsbridge-backups/。</label>
+      <hbox>
+        <button id="jsb-backup" label="立即备份"
+                oncommand="Zotero.JSBridge.backupNow(document)"/>
+      </hbox>
+      <checkbox id="jsb-backup-auto" native="true"
+                preference="extensions.zotero.jsbridge.backup.enabled"
+                label="每次写操作（merge / apply）之前自动备份一次"/>
+      <hbox align="center">
+        <html:input id="jsb-backup-keep" type="text" size="4" dir="ltr"
+                    preference="extensions.zotero.jsbridge.backup.keep"/>
+        <label>份（1 – 200，超出就删最旧的）</label>
+      </hbox>
+      <label>自动备份时如果备份失败，这次写操作会中止，不会照写不误 —— 开了这个开关就是要有兜底，兜不住还写等于白开。</label>
     </groupbox>
   </vbox>
 
@@ -60,7 +89,7 @@
   <vbox class="pref-section">
     <groupbox>
       <label><html:h2>自检</html:h2></label>
-      <label>检查端点是否注册、开关状态、token 文件在不在。它不发 HTTP 请求 —— 从 Zotero 内部发请求会被它自己的 CSRF 防护掐断，测出来的失败说明不了任何问题。</label>
+      <label>检查端点是否注册、开关状态、token 文件在不在、已经有几份备份。它不发 HTTP 请求 —— 从 Zotero 内部发请求会被它自己的 CSRF 防护掐断，测出来的失败说明不了任何问题。</label>
       <hbox>
         <button id="jsb-check" label="检查注册状态"
                 oncommand="Zotero.JSBridge.selfCheck(document)"/>

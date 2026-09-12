@@ -20,6 +20,12 @@ jobs:
       - name: Run endpoint + manifest tests
         run: node test_bridge.js
 
+      # 这一条才算「测试真的在盯着」：把每处修复逐个改回坏的样子，看测试会不会红。
+      # 变异体没被抓住、或者锚点对不上了（跳过），都算失败 —— 静默放过的守卫
+      # 就是一条注释。python3 是 runner 自带的，这里只需要它转调 node。
+      - name: Tests must catch every mutant
+        run: python3 mutate.py
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -29,11 +35,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 三个 .py（客户端 / 打包 / 画图标）没有单元测试，至少保证能编译过、import 得动
+      # 这几个 .py（客户端 / 打包 / 画图标 / 备份体检 / 变异验证）没有单元测试，
+      # 至少保证能编译过、import 得动
       - name: Byte-compile the Python client and scripts
         run: |
-          python -m py_compile zoterojs.py build.py make_icon.py
-          python -c "import zoterojs, build"
+          python -m py_compile zoterojs.py build.py make_icon.py check_backup.py mutate.py
+          python -c "import zoterojs, build, mutate"
 
       # 打包顺带校验 manifest 声明的图标确实进了包
       - name: Build xpi
