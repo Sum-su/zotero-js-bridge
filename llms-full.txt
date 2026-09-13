@@ -1,0 +1,1617 @@
+# Zotero JS Bridge — 全文（llms-full.txt）
+
+本文件由 `build_llms.py` 生成，**不要手改**：改了会在 CI 里被 diff 检查挡下。
+手写的索引在 [llms.txt](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/llms.txt)，那里说明每个文件分别讲什么。
+正文里的相对链接已换成绝对地址，可直接抓取。
+
+
+==============================================================================
+# 源文件：README.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md
+==============================================================================
+
+# Zotero JS Bridge
+
+**English** | [中文](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.zh-CN.md)
+
+A Zotero plugin that exposes eight local HTTP endpoints for running JavaScript inside a live Zotero process, so scripts can merge items, query the library, edit metadata, and take backups without a human pasting code into **Tools → Developer → Run JavaScript**.
+
+[![release](https://img.shields.io/github/v/release/Sum-su/zotero-js-bridge?label=release)](https://github.com/Sum-su/zotero-js-bridge/releases/latest)
+[![CI](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/LICENSE)
+[![Zotero](https://img.shields.io/badge/Zotero-7%2B-brightgreen.svg)](https://www.zotero.org/)
+
+## Why this exists
+
+Zotero's plugin API has no out-of-process channel. Anything the connector API does not cover — merging duplicate items, moving attachments, bulk-editing fields, calling internal modules — can only be done from inside the Zotero process. The plugin attaches to the HTTP server Zotero already runs on `127.0.0.1:23119` and registers eight JSON endpoints there. It does not open a new port and does not hold a socket, so Zotero still exits cleanly.
+
+> [!WARNING]
+> These endpoints execute **arbitrary JavaScript inside Zotero**, with full access to your library. Any process that can read the token file can delete your entire library. This is a personal automation tool, not a hardened service. Read the [security model](#security-model) before installing.
+
+## Requirements
+
+| | |
+| --- | --- |
+| Zotero | 7 through 10 (`strict_min_version` `6.999`, `strict_max_version` `10.99.99`); developed and verified on **Zotero 10.0.2** |
+| Python | 3.8+ for the bundled client; any HTTP client works, the protocol is eight JSON endpoints |
+
+## Install
+
+1. Download `zotero-js-bridge.xpi` from [Releases](https://github.com/Sum-su/zotero-js-bridge/releases/latest).
+2. In Zotero: **Tools → Add-ons → ⚙ → Install Add-on From File…**
+3. Select the `.xpi`. Bootstrapped extensions hot-reload, so a restart is usually unnecessary; if the endpoints do not answer, restart Zotero.
+
+Zotero writes a freshly generated token to `<data-dir>/zoterojs-token.txt`, which the client locates automatically. The plugin adds one pane at **Tools → Preferences → JS Bridge**, containing the switches, the token controls, a **Backup now** button, and a self-check. Every switch takes effect immediately, with no restart.
+
+## Quick start
+
+```bash
+python zoterojs.py ping                              # health check; needs no token
+python zoterojs.py exec "return Zotero.Libraries.userLibraryID"
+python zoterojs.py query --title 物理化学 --limit 20   # structured search, no SQL
+python zoterojs.py doctor                            # read-only library health check
+python zoterojs.py merge MASTERKEY DUPKEY --dry-run   # self-checked merge
+python zoterojs.py apply ops.json                    # dry run until you pass --yes
+python zoterojs.py enrich --scan                     # which PDFs need OCR/vision
+python zoterojs.py backup                            # VACUUM INTO + rotation
+```
+
+`query` prints item keys that feed directly into `merge` and `apply`, so the loop is query → dry-run → confirm → write with no hand conversion.
+
+> [!IMPORTANT]
+> **The three writing commands do not share a default, and the difference is safety-relevant.**
+> `apply` and `enrich` write-back are dry runs unless you pass `--yes`.
+> **`merge` is the exception: it merges for real unless you pass `--dry-run`.** Its `dry_run`
+> parameter also defaults to `False` in the Python client. Rehearse a merge explicitly.
+
+The same surface is available as a library:
+
+```python
+import zoterojs as zjs
+
+zjs.ping()
+zjs.exec("return Zotero.Items.get(1).getField('title')")
+zjs.query(title="岩石", limit=20)                            # read-only
+zjs.doctor()                                                 # read-only
+zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)
+zjs.apply([{"item": "ABCD1234", "set": {"date": "2021"}}])   # dry run is the default
+zjs.enrich(scan=True)                                        # read-only discovery
+zjs.enrich(findings=[...])                                   # write back
+zjs.backup()
+```
+
+Full CLI flags and Python signatures: [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md).
+
+## Endpoints
+
+| Path | Methods | Write? | Purpose |
+| --- | --- | :---: | --- |
+| `/zoterojs/ping` | GET | | Version, Zotero version, endpoint list, live switch state. The only endpoint that needs no token. |
+| `/zoterojs/exec` | POST | ✅ | Run JS with top-level `await` and `return`. Injects `Zotero`, `Services`, `ChromeUtils`, `Components`, `Cu`, `Ci`, `Cc`, `PathUtils`, `IOUtils`, `OS`, and `log()`. |
+| `/zoterojs/merge` | POST | ✅ | Merge duplicates behind eight self-checks. **Not dry by default** — pass `dryRun` to rehearse. |
+| `/zoterojs/logs` | GET, POST | | Read Zotero's error console and/or debug output. |
+| `/zoterojs/query` | GET, POST | | Structured read-only search through Zotero's own `Search`. No SQL. |
+| `/zoterojs/doctor` | GET, POST | | Read-only library health checks; does not touch the network by default. |
+| `/zoterojs/apply` | POST | ✅ | Bulk metadata writes, dry-run by default, with collection-membership diffing. |
+| `/zoterojs/enrich` | GET, POST | ✅ | Fill empty fields from what a vision model read off a scanned PDF. Fill-only, never overwrite. |
+
+`backup` is not an endpoint. It is a button in the preference pane plus an automatic-before-write switch.
+
+Every write is additionally guarded: read-only mode returns `403` for `exec`, `merge`, `apply`, and `enrich`, including their dry-run forms. Detailed parameters, response shapes, and error codes are in [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md).
+
+Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin` header, are dropped by **Zotero's own CSRF guard** before they reach the plugin. Command-line clients are unaffected; browser-side callers must send `x-zotero-connector-api-version`, as with any Zotero plugin endpoint.
+
+In-depth references:
+
+- [`docs/merge.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md) — the eight self-checks, value normalization, the ISBN backstop.
+- [`docs/enrich.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md) — the two modes, the fill-only rule, the three gates and the real errors they were built from.
+
+## Settings
+
+**Tools → Preferences → JS Bridge.** Prefs are read on the request path, so a change applies to the next call; no restart and no re-registration.
+
+| Pref (`extensions.zotero.jsbridge.…`) | Default | Effect |
+| --- | --- | --- |
+| `enabled` | `true` | `false` → all eight endpoints return `503` |
+| `readonly` | `false` | `true` → `exec` / `merge` / `apply` / `enrich` return `403`; reads still work |
+| `endpoint.ping` … `endpoint.enrich` | `true` | `false` → that path returns `404` |
+| `enrich.minChars` | `1000` | Extracted character count below which a PDF counts as having no text layer |
+| `limit.responseKB` | `1500` | Response size cap, clamped to 10–20000 |
+| `backup.enabled` | `false` | `true` → back up before every `merge` / `apply` / `enrich` write |
+| `backup.keep` | `5` | Backups to retain, clamped to 1–200 |
+
+`ping` reports live switch state, so a client can ask what it is allowed to do instead of guessing. `disabled` lists the paths currently switched off and `readonly` carries the live value of that switch.
+
+The pane also holds the token controls (copy / regenerate / rewrite the token file), a **Backup now** button, and a **self-check** button reporting whether the endpoints are registered, what the switches say, and whether the token file exists. The self-check is deliberately static: it does not fire an HTTP request at `127.0.0.1:23119`, because Zotero's own CSRF guard would block it and a failure would then prove nothing.
+
+## Security model
+
+The threat model is a single-user desktop machine. The consequences should be accepted knowingly:
+
+- **The token is a full-access credential.** It is stored in the pref `extensions.zotero.jsbridge.token` and mirrored to `<data-dir>/zoterojs-token.txt`. Anything that can read that file, or read your prefs, can run arbitrary code inside Zotero and destroy your library.
+- **Local-only, but not sandboxed.** Zotero binds its server to `127.0.0.1`, so the endpoints are unreachable from the network. They are reachable by every process on the machine that holds the token.
+- **`exec` is deliberately unrestricted.** It is `new AsyncFunction(...)` over your code. That is the entire point; it is not a sandbox and does not pretend to be one.
+- **No TLS.** Traffic is loopback plaintext.
+
+Present mitigations: a token on every endpoint except `ping`; constant-time comparison against the stored token; a configurable response cap; a master switch, per-endpoint switches, and a read-only mode; endpoint cleanup on `shutdown()`; dry-run defaults on all three writing endpoints; and backups before writes, where a failed backup aborts the write.
+
+**The switches are a blast-radius control, not a security boundary.** They reduce what a script *you* run can do, which is worth having when handing a terminal to something less careful. They do not contain an attacker who already holds the token — such an attacker can flip the prefs back.
+
+Two precision points:
+
+- **Read-only mode is a refusal, not a sandbox.** It does not parse your code. There is no honest way to decide statically how many side effects a given `exec` can produce, so rather than pretend, it closes the write paths entirely (`exec`, `merge`, `apply`, `enrich`, and `logs --clear`) and leaves the read paths (`ping`, `logs`, `query`, `doctor`) open. `apply` and `enrich` are gated even for a dry run: read-only means "this endpoint is unavailable", not "you may rehearse". `enrich` counts as a write on both verbs, including its discovery mode, because `--scan` extracts the full text of several hundred PDFs and takes minutes.
+- **The master switch is enforced on the request path, not at registration.** Disabling the bridge leaves the preference pane in place, which is the only way back — a plugin that removes its own settings UI when disabled cannot be re-enabled from inside Zotero.
+
+Regenerating the token revokes the previous one immediately: the pref and `zoterojs-token.txt` are rewritten, and clients still holding the old token start receiving `403`.
+
+To remove the plugin completely: uninstall it, then delete the pref `extensions.zotero.jsbridge.token` and the `zoterojs-token.txt` file.
+
+## Limitations
+
+- **`enrich` does not render PDFs and does not call a vision model.** Zotero exposes no headless PDF renderer (`Zotero.PDFRenderer` does not exist; `Zotero.PDFWorker` has no render method). Pages must be turned into images by an external script, and so must the model call. The endpoint does exactly two local things: decide which attachments need vision, and write back what vision read.
+- **Mutation testing does not yet cover `enrich`.** The 22 mutants in `mutate.py` all predate the endpoint, so a green suite plus 22/22 caught does not mean the newest code is mutation-covered. That endpoint is currently backed by replaying real vision output instead. See [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md).
+- **The `debug` log source is empty by default.** This is not a fault: the buffer only fills when `extensions.zotero.debug.store` is set, and Zotero resets that pref to `false` at startup, so it yields one session's output per restart. The `console` source always works.
+- **Read-only mode does not constrain `exec`'s capabilities** beyond refusing to run it — see the security model above.
+
+## Development
+
+```bash
+node test_bridge.js              # test suite; needs no Zotero install
+python mutate.py                 # revert each fix, confirm the suite goes red
+python build.py                  # package the xpi
+python build.py --bump           # bump the version first
+python build.py --install        # build, then install into a running Zotero
+python check_backup.py [DIR]     # open each backup read-only, verify integrity
+```
+
+The tests load the real `addon/bootstrap.js` into a Node `vm` context with stubbed Zotero globals and drive the endpoint constructors directly. CI runs the suite, the mutation pass, and a packaging check.
+
+Contributor documentation — harness design, the mutation philosophy, stub fidelity, versioning, and the release ordering rule: [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md).
+
+## Documentation
+
+| File | Contents |
+| --- | --- |
+| [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) | Complete reference for all eight endpoints: parameters, responses, error codes |
+| [`docs/merge.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md) | The merge self-checks, normalization, the ISBN backstop |
+| [`docs/enrich.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md) | Scanned-PDF metadata enrichment: modes, gates, measurements |
+| [`docs/zotero-internals.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md) | Zotero and Firefox platform traps, measured rather than inferred |
+| [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md) | Test harness, mutation testing, packaging, CI, versioning |
+| [`llms.txt`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/llms.txt) | Machine-readable index for language models, with a single-file corpus at [`llms-full.txt`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/llms-full.txt) |
+| [README.zh-CN.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.zh-CN.md) | 中文说明 |
+
+## License
+
+[MIT](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/LICENSE)
+
+
+==============================================================================
+# 源文件：docs/development.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md
+==============================================================================
+
+# Zotero JS Bridge — Development
+
+Contributor documentation for the Zotero JS Bridge: how the test harness and its stubs work, why mutation testing runs on every change, how the xpi is packaged, what CI enforces, and the version and release rules that keep installed users updating.
+
+## Development commands
+
+```bash
+node test_bridge.js              # endpoint suite against stubbed Zotero globals
+python mutate.py                 # revert each fix, confirm the suite goes red
+python make_icon.py --preview    # icon variant preview; writes only addon/icons/_preview.png
+python build.py                  # package the xpi
+python build.py --bump           # increment the version, then package
+python build.py --install        # build, then install into a running Zotero
+python check_backup.py [DIR]     # open each backup read-only, verify integrity
+```
+
+The harness needs Node only (CI uses Node 24). The Python scripts need Python 3 (CI uses 3.11); `make_icon.py` additionally needs Pillow. `build.py --install` requires a running Zotero with the bridge live.
+
+## The test harness (`test_bridge.js`)
+
+The suite needs no Zotero install. It reads the real `addon/bootstrap.js` from disk and runs it in a Node `vm` context whose globals are stubs — `Zotero`, `Services`, `Components`, `ChromeUtils`, `IOUtils`, `PathUtils`, and the built-ins the plugin touches:
+
+```js
+const ctx = vm.createContext(sandboxGlobals);
+vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: "bootstrap.js" });
+const call = (fn, ...a) => vm.runInContext(fn, ctx)(...a);
+```
+
+The suite then calls the real `startup`, takes `Zotero.Server.Endpoints` out of the sandbox, and drives the endpoint constructors directly — `new EP["/zoterojs/ping"]().init({ method, headers, searchParams, data })` — asserting on the returned status and body. Internal helpers are driven through the same context (`call("freeBackupPath", …)`). The manifest is read before `startup` and its version is passed in, so a version bump does not make the suite red. The suite exits non-zero if any test fails.
+
+One manifest test asserts that every icon the manifest declares is present and is a PNG of the declared pixel size:
+
+| Manifest key | File | PNG size |
+| --- | --- | --- |
+| `"48"` | `icons/favicon@0.5x.png` | 48×48 |
+| `"96"` | `icons/favicon.png` | 96×96 |
+
+The check reads bytes 1–3 for the `PNG` signature and the IHDR width and height at byte offsets 16 and 20 (big-endian), comparing each to the manifest key.
+
+## Mutation testing (`mutate.py`)
+
+**Green tests only prove the suite ran.** `mutate.py` reverts 22 individual fixes — one at a time, restoring the file in a `finally` — and checks that the suite turns red for each one. All 22 are currently caught. It is the difference between "the tests pass" and "the tests are watching".
+
+Seventeen mutants edit `addon/bootstrap.js`; five edit `test_bridge.js` itself.
+
+| Target | Mutants | Behaviour reverted (examples) |
+| --- | --- | --- |
+| `addon/bootstrap.js` | 17 | `apply`'s collection diff and its parent-side half, dry-run paths, automatic-backup abort, `LIKE` binding, backup naming and rotation, `doctor` default checks, `query` condition validation, pref names, collection-id resolution |
+| `test_bridge.js` | 5 | the stubbed SQL guard, and four stub behaviours copied from the real library |
+
+The first of the five reverts the stubbed SQL guard to a looser version (`args !== undefined && …`) that once made the stub accept a query the real Zotero rejects; the remaining four undo behaviours copied into the stub from the real library. The principle: **a guard copied into the stub from the real thing needs its own mutant — otherwise it is a comment, not a check.**
+
+### An anchor that stops landing fails the build
+
+Each mutant is anchored on the exact source text of the code it reverts. The runner applies the replacement to the file's current contents; if the anchor is no longer present, the run reports the miss and exits non-zero rather than counting the mutant as skipped or passed, and CI treats that as a build failure. An anchor that no longer matches means the behaviour it pinned has moved, and a guard that quietly stopped watching is the failure mode worth fearing.
+
+The mutant is written with `newline="\n"` and the original is restored in a `finally` with the same argument, so a mutation run does not flip the working copy's line endings to CRLF on Windows.
+
+## Stub fidelity
+
+Stubs are written to match the real modules rather than to be convenient.
+
+`PreferencePanes.register` reproduces the duplicate-id throw and the `plugin-pane-<random>-<pluginID>` id generation from `preferencePanes.js`, because those are the two facts that make a naive re-registration on hot reload fail silently: an explicit id collides and throws, and a missing id quietly produces a second pane, so the plugin must unregister its own id.
+
+The `LIKE` guard is copied into the stub verbatim from Firefox's `modules/Sqlite.sys.mjs` — the regex `/\bLIKE\b\s(?![@:?])/i`, throwing `Please enter a LIKE clause with bindings` — so a query that would throw against a real library fails in the harness instead. The guard is unconditional: omitting the params argument does not pass it, and the suite asserts both the rejection and the legal bound-parameter form.
+
+The SQL router matches statements by distinctive text patterns rather than parsing SQL, so the code under test walks the same retrieval paths it would take against a real database.
+
+A stub shaped wrong makes its tests self-confirming. A previous stub cleared `collections` in `Item.setType`, because changing an item's type was believed to detach it; a test asserted that invented behaviour and passed, until the same operation was run against a real library, where `collectionItems` did not move at all. The behaviour that does detach a collection is setting `parentItemID` (a child item cannot be in a collection), and it has a second half on the other item: parenting a standalone attachment transfers its collections to the parent (`item.js:1944`, "remove from any collections where it existed previously and add parent instead"). Measured on a real library: attachment `4WWZ44HC` in collection 307 lost its `collectionItems` row the moment it was given a parent. The diff watches both items for this reason, and the dry run predicts the transfer; the parent's save passes `skipDateModifiedUpdate`, so its `dateModified` never moves and the transfer cannot be found afterwards by looking for recently modified items.
+
+## Harness honesty assertions
+
+Two assertions do not test the plugin at all. They test whether the harness is still honest, because both failure modes are silent.
+
+- **Unmatched SQL is recorded.** The SQL router records every statement it does not recognize. An unmatched query returns an empty array, and an assertion over that empty array passes having verified nothing. The `[8.9]` self-check block asserts that the record is empty.
+- **A fully-qualified pref name used as a short name is recorded.** `Zotero.Prefs.get(pref)` without `global` prepends `extensions.zotero.`, so a fully-qualified name reads a different key — and a missing pref falls back to its default, which makes "the switch did not work" and "the switch was never on" look identical. The `Prefs` stub records any read or write of a fully-qualified name where a short one was required, and the suite asserts the record is empty. The pane's `preference="…"` attributes are full names on purpose: they are read with `global=true`.
+
+## Packaging (`build.py`)
+
+`python build.py` writes `zotero-js-bridge.xpi` from `addon/`: `manifest.json`, `bootstrap.js`, `prefs.js`, `prefs.xhtml`, and `icons/favicon*.png`. A hand-rolled zip command is not equivalent — omitting `icons/` produces a package with no icon and no error.
+
+`build.py` fails loudly on two conditions, both chosen because they otherwise present as something that looks fine until a user relies on it — for the pane, a control that looks fine until it is clicked:
+
+- A manifest-declared icon that did not make it into the archive: the installed plugin shows a blank icon.
+- A `preference="…"` in the pane with no default in `prefs.js`: the switch is `undefined` once installed, so the pane looks normal and the failure appears only on use.
+
+XML comments in the pane are stripped before this check, so a commented-out `preference="…"` is treated as prose, not as a binding.
+
+`build.py --bump` increments the manifest version before packaging. `build.py --install` packages, then asks the running bridge to install the xpi through `AddonManager`, and polls `ping` (up to 20 attempts, 0.25 s apart) to report which version is live; `install()` resolves before the new instance has started, so an immediate `ping` can return `404 No endpoint found`.
+
+## Continuous integration
+
+`.github/workflows/test.yml` runs on pushes to `main`, on pull requests, and on manual dispatch.
+
+| Job | Steps |
+| --- | --- |
+| `test` (Node 24) | `node test_bridge.js`; `python3 mutate.py` |
+| `build` (Python 3.11) | `py_compile` over `zoterojs.py`, `build.py`, `make_icon.py`, `check_backup.py`, `mutate.py`, then `import zoterojs, build, mutate`; `python build.py`; fail if `updates.json` has a diff; upload `zotero-js-bridge.xpi` as an artifact |
+
+The test job runs the suite and the mutation pass, because the suite alone is not the check: `mutate.py` exits non-zero when a mutant survives or when an anchor no longer matches. The build job re-runs `build.py` and then fails if `git diff` shows `updates.json` changed — `build.py` rewrites that file from the manifest, so a remaining diff means the committed copy and the manifest disagree, which is the "marketplace shows the new version, existing users get no update" bug. The Python scripts have no unit tests; byte-compiling and importing them is the minimum check in CI.
+
+## Versioning
+
+Bump the version on every build: Zotero ignores a reinstall whose version is unchanged. `build.py --bump` accepts only a two-segment version, matching `"(\d+)\.(\d+)"` in `manifest.json` (currently `1.12`). The change from `1.0.11` to `1.12` was a convention change to two-part decimal and was made by hand in `manifest.json`; a three-segment version is rejected rather than bumped, because bumping `1.0.11` to `1.0.12` would break the convention while looking entirely normal. Under the new scheme the second segment is a counter: `1.12 → 1.13 → … → 1.19 → 1.20`, with the carry written `1.20` rather than `1.2`, so the value increases both as a decimal and segment-wise.
+
+## The `updates.json` hazard
+
+`build.py` auto-syncs `updates.json` from `manifest.json` on every run. It parses owner and repo out of the manifest's `update_url`, writes the manifest version into the single update record, and rebuilds the `update_link` as `https://github.com/{owner}/{repo}/releases/download/v{version}/zotero-js-bridge.xpi`, alongside the manifest's `strict_min_version` and `strict_max_version`. More than one update record for the plugin id is a hard error.
+
+Installed plugins read `updates.json` for update checks: the manifest's `update_url` points at it in the repository (`https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/updates.json`). **Pushing a version bump without creating the corresponding Release makes every installed user's update check hit a 404. Push and Release must be done together.**
+
+## Mutation coverage gap
+
+The 22 mutants are a record of fixes that were made, not a per-endpoint coverage matrix. No mutant targets the `enrich` endpoint. A green suite with 22 of 22 mutants caught therefore does not mean the newest code is mutation-covered; `enrich` is currently backed by replaying real vision output instead.
+
+## Backup verification (`check_backup.py`)
+
+```bash
+python check_backup.py                        # <data dir>/jsbridge-backups/
+python check_backup.py D:\somewhere\backups   # a directory or one .sqlite file
+```
+
+"Backup created" and "backup usable" are different claims. Each file is opened read-only (`mode=ro` in the SQLite URI), and the script prints the `PRAGMA integrity_check` result and the row count of five tables: `items`, `collections`, `collectionItems`, `deletedItems`, `itemData`. A table it cannot read is reported, not fatal to the file. The default directory is `<data dir>/jsbridge-backups/`, and the data-directory candidates come from `zoterojs.py` rather than a second copy of the list, so the two cannot drift apart. The script exits non-zero if any file fails to open. A pass means the file is usable; it does not mean the restore procedure has been rehearsed.
+
+## See also
+
+- [`zotero-internals.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md) — the Zotero and Firefox platform behaviour the stubs reproduce.
+- [`endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) — the endpoint contract the suite asserts.
+- [`../README.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) — install, settings, the security model, and limitations.
+
+
+==============================================================================
+# 源文件：docs/endpoints.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md
+==============================================================================
+
+# Zotero JS Bridge endpoint reference
+
+This file is the complete reference for the eight HTTP endpoints that the Zotero JS Bridge plugin (v1.12) registers on Zotero's own local server, with each endpoint's purpose, parameters, response shape, and error codes.
+
+## The endpoint layer
+
+Zotero already runs an HTTP server on `127.0.0.1:23119` for its connector API. The plugin registers eight paths on that server, so a local script can execute JavaScript inside a running Zotero, merge duplicates, read the error console, query the library, and run health checks. All eight ride on Zotero's own server: nothing new is bound, and no socket is held open, so Zotero still exits cleanly.
+
+Four endpoints can write (`exec`, `merge`, `apply`, `enrich`); the other four are read-only (`ping`, `logs`, `query`, `doctor`). Read-only mode closes the write paths and leaves the read ones open.
+
+Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin` header, are dropped by Zotero's own CSRF guard before they reach the plugin. Command-line clients are unaffected; browser-side callers need `x-zotero-connector-api-version`, as with any Zotero plugin endpoint.
+
+## Endpoint summary
+
+| Method(s) | Path | Auth | Writes |
+| --- | --- | --- | --- |
+| GET | `/zoterojs/ping` | none | no |
+| POST | `/zoterojs/exec` | `X-ZoteroJS-Token` | yes |
+| POST | `/zoterojs/merge` | `X-ZoteroJS-Token` | yes |
+| GET, POST | `/zoterojs/logs` | `X-ZoteroJS-Token` | no; `clear=true` counts as a write |
+| GET, POST | `/zoterojs/query` | `X-ZoteroJS-Token` | no |
+| GET, POST | `/zoterojs/doctor` | `X-ZoteroJS-Token` | no |
+| POST | `/zoterojs/apply` | `X-ZoteroJS-Token` | yes, including a dry run |
+| GET, POST | `/zoterojs/enrich` | `X-ZoteroJS-Token` | yes, on both verbs |
+
+## Authentication, gates, and error codes
+
+Every endpoint except `ping` requires the request header `X-ZoteroJS-Token`. The value is the plugin's token: it lives in the Zotero pref `extensions.zotero.jsbridge.token` and is mirrored to `<data-dir>/zoterojs-token.txt`, which is where the bundled client reads it. The comparison against the stored token is constant-time. Regenerating the token revokes the old one immediately — a client still holding the old value starts receiving `403`.
+
+Authentication is checked before the gate, so a request with a missing or incorrect token receives `403` even when the endpoint or the whole bridge is switched off. The gate reads the prefs on every request, so a change in the preferences pane takes effect on the next call:
+
+| Code | Condition | Extra body fields |
+| --- | --- | --- |
+| `503` | the master switch `extensions.zotero.jsbridge.enabled` is `false` | `error`, `pref` |
+| `404` | that endpoint's own pref `extensions.zotero.jsbridge.endpoint.<name>` is `false` | `error`, `pref` |
+| `403` | the bridge is in read-only mode (`extensions.zotero.jsbridge.readonly`) and the call counts as a write | `error`, `pref` |
+
+The write-gated endpoints are `exec`, `merge`, `apply`, and `enrich`. `apply` and `enrich` are refused even for a dry run: read-only mode means the endpoint is not available, not that a rehearsal is allowed. `enrich` is gated as a write on both verbs, because its scan form extracts the full text of hundreds of PDFs and takes minutes. `logs` is gated as a read, and only its `clear` parameter is refused in read-only mode.
+
+A missing or invalid token produces `403` with `{"ok": false, "error": "missing or invalid X-ZoteroJS-Token"}`. Bad parameters produce `400`; an unexpected internal failure produces `500` with `error` and `stack`.
+
+Every JSON response is capped at `extensions.zotero.jsbridge.limit.responseKB` KB, default 1500 and clamped to 10–20000. When a payload exceeds the cap, the response keeps `ok` and adds `truncated: true` plus a `note`; `logs` is clipped to at most the last 50 entries within 4000 characters (with `logsOmitted` when entries are dropped), and `result` is re-serialized to depth 2.
+
+## The `ping` endpoint
+
+Health check and capability probe. `ping` needs no token and takes no parameters. It reports the plugin version, the Zotero version, the user library ID, the full endpoint list, which endpoints are currently switched off, and the live value of the read-only switch, so a client can ask what it is allowed to do rather than guessing.
+
+Method: `GET`.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| — | — | — | None. |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `name` | string | `"Zotero JS Bridge"` |
+| `version` | string | plugin version — `"1.12"` in this release |
+| `zotero` | string | `Zotero.version` |
+| `libraryID` | number | user library ID |
+| `endpoints` | array | all eight paths |
+| `disabled` | array | the subset of paths currently switched off |
+| `readonly` | boolean | live value of the read-only switch |
+
+`disabled` and `readonly` are additive fields: clients that predate them see the same shape they always did.
+
+```console
+$ python zoterojs.py ping
+{ "ok": true, "name": "Zotero JS Bridge", "version": "1.12", "zotero": "10.0.2",
+  "libraryID": 1, "endpoints": ["/zoterojs/ping", ...], "disabled": [], "readonly": false }
+```
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `503` | master switch off |
+| `404` | `endpoint.ping` off |
+
+Because no token is required, `ping` cannot return an authentication error. It can be switched off like any other endpoint.
+
+Bundled client: `zjs.ping()`, `python zoterojs.py ping`.
+
+## The `exec` endpoint
+
+Runs arbitrary JavaScript inside the running Zotero process. The code has `Zotero`, `Services`, `ChromeUtils`, `Components`, `Cu`, `Ci`, `Cc`, `PathUtils`, `IOUtils`, `OS`, and `log(...)` in scope. `Cu`, `Ci`, and `Cc` are `Components.utils`, `Components.interfaces`, and `Components.classes`. Values passed to `log(...)` are joined into strings and collected into the response's `logs` array instead of going to a console. Top-level `await` and `return` both work.
+
+The code is compiled with `new AsyncFunction("Zotero", ..., "log", '"use strict";\n' + code)`. It is deliberately unrestricted: it runs with full access to the library and the Zotero process, and it is not a sandbox and does not pretend to be. The response's `mode` field reports which path ran: `"AsyncFunction"` normally, `"sandbox"` if the constructor itself was unavailable and the endpoint fell back to a system-principal `Cu.Sandbox` (exposing `Zotero`, `Services`, `Components`, `PathUtils`, `IOUtils`, and `log`), or `"unavailable"` if both failed.
+
+Method: `POST` with an `application/json` body.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `code` | string | required | JavaScript source; a blank value returns `400` |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` when the code finished without throwing |
+| `mode` | string | `"AsyncFunction"`, `"sandbox"`, or `"unavailable"` |
+| `ms` | number | wall-clock duration in milliseconds |
+| `logs` | array of strings | values collected by `log(...)` during the call |
+| `result` | any | the returned value, serialized; present when `ok` is `true` |
+| `error` | string | exception message; present when `ok` is `false` |
+| `stack` | string | stack of the thrown error; present when `ok` is `false` |
+
+The serializer caps strings at 20000 characters, arrays at 300 entries, objects at 120 keys, and nesting at depth 4; Zotero Item and Collection objects are summarized to a few key fields instead of being dumped. A promise nested in a returned object is replaced by a marker string stating that it was not awaited, rather than serializing to `{}`.
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | `code` is missing or blank |
+| `403` | missing or invalid token; read-only mode (`exec` is a write) |
+| `404` | `endpoint.exec` off |
+| `503` | master switch off |
+
+A JavaScript exception is not an HTTP error: the call returns HTTP `200` with `ok: false`, the error message, and the stack.
+
+```console
+$ python zoterojs.py exec "return Zotero.Libraries.userLibraryID"
+1
+```
+
+Bundled client: `zjs.exec(code, timeout=300)`, `zjs.execv(code)` for the bare result; `python zoterojs.py exec "<js>"`.
+
+## The `merge` endpoint
+
+Merges duplicate items behind a self-check. A merge runs only if every check passes. The rule is missing ≠ conflict — two items conflict only when both have a value and the values differ. That matters because online-first articles legitimately have no volume, issue, or pages yet, and a naive comparison rejects them as false duplicates.
+
+The checks are same title, same item type, year, volume, issue, pages, DOI, and ISBN. Values are normalized before comparison: whitespace, `_.,;:()[]`, CJK punctuation, and every dash variant — ASCII `-`, en dash `–`, em dash `—`, minus sign `−`, non-breaking hyphen, zero-width space. Normalization matters because Zotero's translators routinely deliver `1–10` (U+2013) where `1-10` was typed, and comparing them literally rejects a genuine duplicate.
+
+The ISBN check is the backstop for the classic disaster: two volumes of the same textbook with identical title and authors, differing only in ISBN and edition. Nothing else in the list separates them — `creators` and `edition` are not compared — so without that check the pair would pass, `master` would survive, and the duplicate volume would go to the trash. With it, the check fails, the duplicate is skipped, and both volumes stay. The backstop has one boundary: if only one volume carries an ISBN, missing ≠ conflict treats the pair as compatible and the check does not fire.
+
+Method: `POST` with an `application/json` body.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `master` | string | required | key of the item that survives |
+| `dups` | array of strings | required, non-empty | keys of the items to merge into `master`; each is moved to the trash |
+| `dryRun` | boolean | `false` | run every check and report, without merging |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `false` when `master` does not exist or is already in the trash; individual duplicate refusals are `report` entries, not errors |
+| `dryRun` | boolean | echo of the request |
+| `master` | object | `{key, title}` of the surviving item |
+| `report` | array | one entry per duplicate key |
+| `attachmentsAfter` | number | attachment count on `master` after the run |
+| `backup` | object | present when the automatic backup ran (a real merge with the backup switch on) |
+
+Each `report` entry contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `key` | string | the duplicate key |
+| `merged` | boolean | whether it was merged |
+| `why` | string | reason for a refusal: the item does not exist, is already in the trash, failed the self-check, or the merge call threw |
+| `checks` | object | per-check booleans, present when the self-check ran |
+| `dryRun` | boolean | `true` on a rehearsal entry |
+| `attachments` | number | combined attachment count of `master` and the duplicate |
+| `collections` | number | combined collection count; dry-run entries only |
+
+The deep dive, including the reasoning behind missing ≠ conflict, is in [the `merge` self-check](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md).
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | `master` is missing or `dups` is empty |
+| `403` | missing or invalid token; read-only mode (`merge` is a write, dry run included) |
+| `404` | `endpoint.merge` off |
+| `500` | an unexpected exception, including a failed automatic backup — the merge is then aborted |
+| — | a missing or trashed `master` returns HTTP `200` with `ok: false` and an `error` string |
+
+```console
+$ python zoterojs.py merge ABCD1234 EFGH5678 --dry-run
+{ "ok": true, "dryRun": true, "report": [{ "key": "EFGH5678", "merged": false, ... }] }
+```
+
+Bundled client: `zjs.merge(master, dups, dry_run=False)`; `python zoterojs.py merge MASTERKEY DUPKEY [DUPKEY ...] [--dry-run]`.
+
+## The `logs` endpoint
+
+Reads Zotero's error console and/or its debug output, so a script can check what a plugin — including this one — actually did without clicking through **Tools → Developer → Error Console**.
+
+```bash
+python zoterojs.py logs                         # newest 100 console messages
+python zoterojs.py logs --min-level warning     # errors + warnings only
+python zoterojs.py logs --grep "JS Bridge"      # anything mentioning the bridge
+python zoterojs.py logs --source debug          # Zotero's own debug log
+```
+
+Methods: `GET` or `POST`. Parameters work the same over GET or POST (JSON body); a parameter supplied in both places takes its POST body value.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `source` | string | `console` | `console`, `debug`, or `both` |
+| `minLevel` | string | `all` | `all` / `debug` / `info` / `warn` / `error` — "at least this severe". Also accepted under the alias `level` |
+| `category` | string | — | substring match, case-insensitive |
+| `grep` | string | — | substring match on the text (and on `logger`, when present) |
+| `since` | number | — | epoch ms; only messages at or after this |
+| `limit` | number | `100` | max messages to return, newest kept first (cap 1000) |
+| `clear` | boolean | `false` | clear the sources you read — destructive, and refused in read-only mode |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `source` | string | normalized source name |
+| `params` | object | echo of the request parameters |
+| `console` | object | console results; present unless `source=debug` |
+| `debug` | object | debug results; present unless `source=console` |
+| `cleared` | array | names of the sources that were cleared, when `clear` was set |
+| `clearError` | string | present when clearing threw |
+
+The `console` object contains `total`, `matched`, `returned`, `messages`, and — when matches were dropped — `omitted`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `total` | number | messages in the console buffer before filtering |
+| `matched` | number | messages that passed the filters |
+| `returned` | number | messages in this response |
+| `omitted` | number | matched minus returned, when positive |
+| `messages` | array | the message objects; the newest `limit` are kept, then returned in chronological order |
+
+Each message comes back with these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `time` | number | epoch milliseconds |
+| `iso` | string | ISO 8601 form of `time`, when `time` is nonzero |
+| `level` | string | classified severity |
+| `message` | string | the text, with the `Log.sys.mjs` prefix stripped when one was present |
+| `logger` | string | logger name from that prefix, when present |
+| `category` | string | when the console entry has one |
+| `source` | string | source name, when the entry has one |
+| `line`, `column` | number | script position, when the entry has them |
+| `flags` | number | the entry's numeric flags, when present |
+| `logLevel` | number | the entry's numeric log level, when present |
+| `messageClipped` | number | original length, when a message exceeded 2000 characters |
+
+The `debug` object contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `storing` | boolean | `Zotero.Debug.storing` |
+| `count` | number | `Zotero.Debug.count()` |
+| `enabled` | number | `Zotero.Debug.enabled` |
+| `text` | string | the debug output |
+| `note` | string | present when the buffer is empty, explaining how to enable it |
+| `textClipped` | number | original length, when the text exceeded 100000 characters and the tail was kept |
+| `error` | string | when reading the debug buffer threw |
+
+### `Log.sys.mjs` prefix stripping and level classification
+
+Messages that Firefox's `Log.sys.mjs` wrote carry a `<timestamp>\t<logger>\t<LEVEL>\t` prefix, where LEVEL is one of `FATAL` / `ERROR` / `WARN` / `INFO` / `CONFIG` / `DEBUG` / `TRACE`. That prefix is stripped (the logger name is returned separately as `logger`), and the level is taken from the text rather than from the entry's `logLevel` field, because the two disagree in practice: an `addons.xpi` entry whose body reads `WARN` reports `logLevel = 1`, which is info. Trusting `logLevel` would make `minLevel=warn` silently drop it — the exact entry that filter exists to find. Messages without the prefix fall back to the entry's `flags` (for script errors) and then to `logLevel` (debug=0, info=1, warn=2, error=3).
+
+### The two `logs` sources are not interchangeable
+
+`console` is always populated and needs no configuration. `debug` is empty by default and that is not a bug: the buffer only fills when `extensions.zotero.debug.store` is set, and that pref is one-shot — Zotero reads it at startup and immediately resets it to `false`. Set it, restart Zotero, and one session's worth of output is available. When the buffer is empty the endpoint says so in `debug.note` and explains this, instead of returning nothing.
+
+Debug output is read via `Zotero.Debug.get()`. The `get(maxChars, maxLineLength)` form is not used, because passing `maxLineLength` makes Zotero ellipsize lines in place inside its own buffer, permanently truncating output the user may still be reading. `getConsoleViewerOutput()` is not used because it drains the viewer's queue, which would silently steal lines from an open debug-output window. The no-argument call avoids both; its cost is that it also appends system information and the error report, a few hundred bytes.
+
+`clear` clears only the sources read in the same call — `console` via `Services.console.reset()`, `debug` via `Zotero.Debug.clear()` — and reports them in `cleared`. In read-only mode a `clear` request is refused with `403` while ordinary reads still work. Failures to reach the console or debug APIs are reported inside the corresponding object (`console.error` or `debug.error`), not as HTTP errors.
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | `source` is not `console`, `debug`, or `both` |
+| `403` | missing or invalid token |
+| `403` | `clear` requested while read-only mode is on (`pref` names the read-only pref) |
+| `404` | `endpoint.logs` off |
+| `503` | master switch off |
+
+Bundled client: `zjs.logs(source="console", min_level="all", limit=100, grep=None, category=None, since=None, clear=False, timeout=60)`; CLI flags `--source`, `--min-level`, `--limit`, `--grep`, `--category`, `--since`, `--clear`.
+
+## The `query` endpoint
+
+Structured read-only search that wraps Zotero's own `Search` object, so callers need no SQL and never touch the SQL layer's traps (a `LIKE` pattern must be bound, literal question marks in strings break parsing, and full-width characters can break the parser). Condition names and operators are not guessed: they are looked up live in `Zotero.SearchConditions` from Zotero's real source. An unknown condition or an unsupported operator returns `400` naming the field's available operators and the list of common condition names. The search is scoped to the user library.
+
+Methods: `GET` or `POST` (JSON body).
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `title`, `doi`, `isbn`, `creator`, `author`, `collection`, `tag`, `itemType`, `type`, `key`, `abstract`, `journal`, `q`, `text`, `year` | string | — | shorthand conditions, mapped to Zotero conditions by the [shorthand mapping](#query-shorthand-conditions) |
+| `<name>Op` | string | field-dependent | operator for the matching shorthand, e.g. `titleOp`; the default is `contains` when the field supports it, otherwise `is`, otherwise `true`, otherwise the field's first operator |
+| `where` | array | `[]` | extra conditions as `[{field, op, value}, ...]`, for anything the shorthands do not cover |
+| `unfiled` | boolean | `false` | restrict to items that are in no collection |
+| `fields` | string or array | `[]` | extra fields to return per item |
+| `limit` | number | `50` | maximum items returned, clamped to 1–500 |
+| `includeCollections` | boolean | `true` | include each item's collections |
+
+### `query` shorthand conditions
+
+| Shorthand | Zotero condition |
+| --- | --- |
+| `title` | `title` |
+| `doi` | `DOI` |
+| `isbn` | `ISBN` |
+| `creator`, `author` | `creator` |
+| `collection` | `collection` (a collection key or name) |
+| `tag` | `tag` |
+| `itemType`, `type` | `itemType` |
+| `key` | `key` |
+| `abstract` | `abstractNote` |
+| `journal` | `publicationTitle` |
+| `q` | `titleCreatorYear` (title + creator + year) |
+| `text` | `fulltextContent` |
+| `year` | `year` |
+
+At least one condition is required; a request with none returns `400`.
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `total` | number | matches before `limit` was applied |
+| `returned` | number | items in this response |
+| `items` | array | the first `limit` matches |
+| `conditions` | array | the conditions actually used, as `[field, op, value]` triples |
+| `omitted` | number | `total` minus `returned`, when positive |
+| `hint` | string | present with `omitted`; notes that `items[].key` can be fed to `merge` / `apply` |
+
+Each item contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `key` | string | item key — feed it straight into `merge` / `apply` |
+| `itemID` | number | Zotero's numeric ID |
+| `itemType` | string | item type name |
+| `title` | string | title |
+| `date` | string | date field |
+| `creators` | array | creator lines |
+| `inTrash` | boolean | whether the item is in the trash |
+| `parent` | string | parent key, when the item has a parent |
+| `collections` | array | `{key, name}` objects, when `includeCollections` is on |
+| requested `fields` | any | copied onto the item; a field the item type does not have is returned as a marker string instead of being omitted |
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | unknown condition or unsupported operator; the error text names the field's valid operators and the common condition names |
+| `400` | no conditions given |
+| `400` | the search itself failed |
+| `403` | missing or invalid token |
+| `404` | `endpoint.query` off |
+| `500` | an unexpected exception |
+| `503` | master switch off |
+
+Bundled client: `zjs.query(title=None, doi=None, isbn=None, creator=None, collection=None, tag=None, item_type=None, key=None, q=None, unfiled=False, where=None, fields=None, limit=50, include_collections=True, timeout=120)`; CLI `python zoterojs.py query --title 物理化学 --limit 20`.
+
+## The `doctor` endpoint
+
+Read-only library health check. Seven checks are available. By default all of them run except `sync`; `sync` contacts zotero.org, so it must be requested explicitly. The endpoint does not touch the network unless `sync` is named.
+
+Methods: `GET` or `POST` (JSON body).
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `checks` | string or array | all except `sync` | check names to run |
+| `all` | boolean | `false` | run all seven checks, `sync` included |
+| `days` | number | `30`, clamped to 1–3650 | window used by `trashWriteback` |
+| `titles` | string or array | `Full Text PDF` | importer-default titles counted by `attachmentTitle` |
+
+The checks:
+
+| Check | Reports |
+| --- | --- |
+| `orphanStorage` | directories under `<data-dir>/storage` with no matching attachment row (`count`, `scanned`, and a sample of up to 20) |
+| `unfiled` | items in no collection, using Zotero's own `unfiled` search condition rather than hand-written SQL (`count` plus a sample of up to 20) |
+| `attachmentTitle` | attachment titles still at an importer default, empty titles, and titles that match neither the full filename nor its extensionless form (`count`, `emptyCount`, `mismatchCount`, with samples) |
+| `duplicateFilenames` | two identically named attachments under the same parent item (`count` plus a sample) |
+| `duplicates` | bibliographic items sharing a DOI or ISBN (grouped, up to 50 groups, the first 5 detailed). Reported as leads, not verdicts — two volumes of one textbook are not duplicates |
+| `trashWriteback` | items in the trash (`deletedItems`) modified within the last `days` days, plus the total trash size; plugins that use the trash as private storage show up here |
+| `sync` | last sync time, whether unsynced data exists, and the local vs server library version via `api.zotero.org`; requires a login and network access |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `checks` | object | one entry per check that ran, keyed by check name |
+| `ran` | array | names of the checks that ran |
+| `ms` | number | total duration in milliseconds |
+| `note` | string | restates that the check is read-only and that `sync` runs only when requested |
+
+A check that throws is reported as an error string inside its own `checks` entry; the other checks still run.
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | unknown check name; the error text lists the valid names |
+| `403` | missing or invalid token |
+| `404` | `endpoint.doctor` off |
+| `500` | an unexpected exception |
+| `503` | master switch off |
+
+Bundled client: `zjs.doctor(checks=None, all_checks=False, days=30, timeout=300)`; CLI `python zoterojs.py doctor [CHECK ...] [--all] [--days N]`.
+
+## The `apply` endpoint
+
+Batch metadata writes. The endpoint exists because attaching an item as a child silently strips its collection membership — a collection may not contain an item with a parent — and checking `collectionItems` afterwards is the step everyone forgets. Every op therefore reports a collection membership diff.
+
+Method: `POST` with an `application/json` body.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `ops` | array | required, non-empty | the operations to apply |
+| `dryRun` | boolean | `false` at the endpoint; the bundled client and CLI default to a dry run | report what would change, without writing |
+| `stopOnError` | boolean | `true` | stop after the first op that errors |
+| `tag` | string | `apply` | label recorded on the automatic-backup descriptor |
+
+Each op can carry:
+
+| Op field | Type | Meaning |
+| --- | --- | --- |
+| `item` or `key` | string | key of the item to edit |
+| `set` | object | field → value; only fields whose string value differs are changed |
+| `setCreators` | array | creator strings or creator objects; a string is written in single-field mode (`creatorType: author`, `fieldMode: 1`, `lastName`), so a CJK name is not split by Zotero's "first character is the surname" rule |
+| `setType` | string or number | item type name or numeric type ID |
+| `parent` | string or null | parent item key, or `null` to detach |
+| `addToCollection` | string or array | collection key(s) to add |
+| `removeFromCollection` | string or array | collection key(s) to remove |
+| `expect` | object | field → expected current value; any mismatch skips the op |
+
+Response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `dryRun` | boolean | echo of the request |
+| `applied` | number | ops with status `applied` |
+| `skipped` | number | ops skipped because `expect` did not match |
+| `errors` | number | ops that errored |
+| `report` | array | one entry per op |
+| `backup` | object | present when the automatic backup ran |
+| `warning` | string | present when any record reports `collectionsLost` or `parentCollectionsGained` |
+
+Each `report` entry contains `item` and `status` — one of `applied`, `would-change` (dry run), `no-change`, `skipped`, `error` — plus:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `changes` | array | `{field, from, to}` per change; collection ops also carry `collectionID` |
+| `collections` | array | current collection membership, on dry-run entries |
+| `collectionsBefore`, `collectionsAfter` | array | membership before and after the write |
+| `collectionsLost` | array | membership dropped by the write that the op did not itself request |
+| `parentItem` | string | the parent, when the op set one |
+| `wouldGiveParent` | array | dry run: collections the parent would receive |
+| `parentCollectionsBefore`, `parentCollectionsAfter`, `parentCollectionsGained` | array | the parent side of attaching a child: Zotero transfers the child's collection membership to the parent, and the parent's save skips the date-modified update, so the transfer cannot be found afterwards by looking for recently changed items |
+| `mismatch` | array | for skipped entries: `{field, want, got}` |
+| `why` | string | human-readable reason for a skip or error |
+
+A failed automatic backup aborts the whole call with `500`; nothing is written.
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | `ops` is missing or empty |
+| `403` | missing or invalid token; read-only mode (`apply` is a write, dry run included) |
+| `404` | `endpoint.apply` off |
+| `500` | an unexpected exception, including a failed automatic backup |
+| `503` | master switch off |
+
+```bash
+python zoterojs.py apply ops.json [--yes] [--keep-going]
+```
+
+Bundled client: `zjs.apply(ops, dry_run=True, stop_on_error=True, timeout=300)`. The CLI writes only when `--yes` is passed; without it the run is a rehearsal.
+
+## The `enrich` endpoint
+
+Scanned-PDF metadata completion. The endpoint has two modes and one rule.
+
+**Mode A — find candidates** (writes nothing): name items with `items=` for a fast per-item answer, or scan the whole library with `scan=1`. The judge is the character count extracted from `Zotero.PDFWorker.getFullText`; a scan pre-filters on `Zotero.Fulltext.getIndexedState` first. The results page lists attachment keys, real file paths, extracted character counts, and index states.
+
+**Mode B — write back what vision read**: send `findings`, one entry per item with the fields extracted from page images. Writes go through the same code as `apply` — backup and collection diffing — so an `enrich` write gets a backup tagged `enrich` and the same `collectionsLost` / `parentCollectionsGained` warnings. The per-op `expect` guard is **not** in play: it is read off each op (`bootstrap.js:1224`) and the ops this endpoint generates carry only `item`, `set`, and `setCreators`.
+
+**The rule: fill empty fields, never overwrite.** Two-sided differences become `conflict` and are reported, not written. Overwriting is `apply`'s job, where it is stated explicitly. `strict` (default `true`) holds back any finding that fails a pre-condition gate.
+
+Methods: `GET` or `POST` (JSON body). Both verbs are gated as a write, because the scan form is expensive even though it writes nothing.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `findings` | array | — | mode B: one entry per item (`item`, `pages`, `title`, `publisher`, `year`, `month`, `isbn`, `authors`, `evidence`, ...); when present, write-back mode |
+| `items` | string or array | — | mode A: item keys to name (comma-separated or a JSON array) |
+| `scan` | boolean | `false` | mode A: scan the whole library |
+| `includeIndexed` | boolean | `false` | scan mode: skip the `getIndexedState` pre-filter |
+| `missingOnly` | boolean | `true` | mode A: skip items whose fillable fields are already complete |
+| `minChars` | number | `enrich.minChars` pref, default `1000` | an attachment whose extracted character count falls under this counts as having no text layer |
+| `limit` | number | `100`, clamped to 1–1000 | page size in scan mode |
+| `offset` | number | `0` | paging offset in scan mode |
+| `dryRun` | boolean | `false` at the endpoint; the bundled client and CLI default to a dry run | mode B: report without writing |
+| `strict` | boolean | `true` | mode B: run the pre-condition gates |
+| `stopOnError` | boolean | `true` | mode B: passed through to the `apply` write path |
+
+Mode A response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `minChars` | number | threshold used |
+| `missingOnly` | boolean | echo of the filter |
+| `itemsProbed` | number | items examined |
+| `attsProbed` | number | attachments examined |
+| `skippedIndexed` | number | attachments skipped by the pre-filter |
+| `candidates` | number | items with at least one candidate attachment |
+| `offset`, `limit` | number | echo of the paging |
+| `page` | array | the current page of candidates |
+| `truncated` | boolean | whether more candidates exist beyond the page |
+| `errorReport` | array | items that were named but do not exist |
+
+Each `page` entry contains `item`, `type`, `title`, `missing` (fillable fields that are empty), and `atts`: `{akey, file, chars, state, filename}`, plus `error` when extraction failed.
+
+Mode B response fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | boolean | `true` on success |
+| `strict` | boolean | echo of the request |
+| `findings` | number | entries supplied |
+| `gated`, `gatedReport` | number, array | findings held back by a gate, with the reasons and the evidence line |
+| `checked` | number | findings that passed the gates |
+| `withOps` | number | findings that produced a write op |
+| `tally` | object | per-kind counts across all checked fields |
+| `report` | array | every checked item, with per-field `from` / `to` / `kind` rows; items whose fields all matched are kept, not filtered out |
+| `errors`, `errorReport` | number, array | entries that could not be processed |
+| `apply` | object | the `apply` report for the write, empty when there is nothing to write |
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | write-back mode with an empty `findings`; scan mode with neither `items` nor `scan` |
+| `403` | missing or invalid token; read-only mode (both verbs and both modes) |
+| `404` | `endpoint.enrich` off |
+| `500` | an unexpected exception, including a failed automatic backup |
+| `503` | master switch off |
+
+```bash
+python zoterojs.py enrich --items KEY1,KEY2      # who needs OCR/vision
+python zoterojs.py enrich --scan                 # ... across the whole library
+python zoterojs.py enrich findings.json [--yes]  # write back what vision read
+```
+
+Bundled client: `zjs.enrich(findings=None, items=None, scan=False, dry_run=True, strict=True, stop_on_error=True, missing_only=None, min_chars=None, include_indexed=False, limit=None, offset=None, timeout=300)`. The CLI writes back only with `--yes`; `--loose` turns the gates off for a negative test. The deep dive — the measured case for using extracted character count over `getIndexedState`, the three gates, and the `series` rule — is in [the `enrich` endpoint](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md).
+
+## Backups are not an HTTP endpoint
+
+`backup` is not one of the eight endpoints. There is no `/zoterojs/backup` path. Backups have two entry points:
+
+- a **Backup now** button in the preferences pane (**Tools → Preferences → JS Bridge**), and
+- the automatic-before-write switch `extensions.zotero.jsbridge.backup.enabled` (default `false`). When it is on, `merge`, `apply`, and `enrich` take a full backup before writing, and a failed backup aborts the write — an opt-in safety net that silently misses is worse than none.
+
+The mechanism is SQLite's `VACUUM INTO`: a clean single-file copy at `<data-dir>/jsbridge-backups/zotero-<timestamp>.sqlite`, taken without touching the live database. Rotation keeps `extensions.zotero.jsbridge.backup.keep` copies (default `5`, clamped to 1–200). A name collision gets a numeric suffix instead of overwriting the previous file. The backup descriptor is `{path, bytes, ms, kept, removed, remaining}`, and it appears as the `backup` field of the `merge` / `apply` / `enrich` responses with a `reason` of `merge`, `apply`, or `enrich`. The pane's backup function returns `{ok: true, ...}` or `{ok: false, error, dir}` rather than throwing.
+
+The bundled client's `python zoterojs.py backup` therefore runs through the `exec` endpoint, calling `Zotero.JSBridge.backupNow()`.
+
+## See also
+
+- [The `merge` self-check](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md)
+- [The `enrich` endpoint](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md)
+- [Zotero internals notes](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md)
+- [Project README](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md)
+
+
+==============================================================================
+# 源文件：docs/enrich.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md
+==============================================================================
+
+# The `enrich` endpoint
+
+`/zoterojs/enrich` finds scanned PDF attachments that have no usable text layer and writes back the bibliographic metadata that a human or a vision model read off their cover or copyright page, filling empty fields only and never overwriting an existing value.
+
+It is the last resort for the tail of a library that no translator will ever identify: scanned PDFs with no text layer, where the only remaining source of metadata is what a person or a vision model can see on the page images. The endpoint has two modes and one rule. Rendering the pages and calling the vision model are deliberately outside the plugin. The endpoint was added in version 1.12.
+
+## Scope: the plugin decides who needs vision and writes back what vision read
+
+`enrich` is not an OCR endpoint. Rendering and the vision-model call are intentionally not here. The plugin performs exactly two local jobs:
+
+1. decide which attachments need vision, from evidence Zotero already holds (Mode A, read-only);
+2. write back what vision read, under the one rule and the three gates (Mode B, dry-run by default).
+
+Two reasons keep the boundary where it is:
+
+- The plugin should not take on new dependencies. Page rendering and model clients bring their own stack, which does not belong inside a Zotero add-on.
+- A step that can time out or cost money does not belong inside an HTTP request. A request against named items answers quickly, while rendering a scan and calling a vision model runs for minutes and can cost money per call.
+
+The caller keeps the loop: render the pages with a tool of its choice, ask a vision model for the fields, then post the result back for the gates and the write.
+
+## The rule: fill empty fields, never overwrite
+
+An empty library field is filled from the finding. When both sides carry values and the values differ, the field is reported as `conflict` and left unchanged. Overwriting is `apply`'s job, where the caller names the field and the value explicitly ([endpoints.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md)). Two-sided differences are never merged, guessed, or resolved in favor of the extracted value.
+
+## Mode A: read-only discovery of attachments that need vision
+
+```bash
+python zoterojs.py enrich --items KEY1,KEY2    # named items, per-item real answer
+python zoterojs.py enrich --scan               # whole library, index prefilter first
+```
+
+Python callers use `zjs.enrich(items=["ABCD1234"])` and `zjs.enrich(scan=True)`.
+
+A call needs one of `findings`, `items`, or `scan`; a request with none of the three returns HTTP 400. The endpoint is gated as a write endpoint even for GET requests, because Mode B writes and a full scan runs for minutes, so read-only mode answers 403 for both modes (`addon/bootstrap.js:1959`).
+
+### The judge is the extracted character count, not the full-text index state
+
+The decision input is the number of characters returned by `Zotero.PDFWorker.getFullText` for the attachment, not `Zotero.Fulltext.getIndexedState`. The index state does not separate the two cases. Measured on a real library, both of the first two rows below are normal books, and both report `PARTIAL`:
+
+| Attachment | Extracted chars | `getIndexedState` |
+| --- | --- | --- |
+| `23NZF8PY` | 100,117 | `PARTIAL` — a normal book, one page has no text |
+| `27RCEEVC` | 297,684 | `PARTIAL` — same story |
+| `2J4LLG6Q` | 0 | `UNINDEXED` |
+| `4BY9B5LC` | 0 | `PARTIAL` |
+
+The last two rows are the same thing (pure scans) with different index states, which is the whole argument against using the state as the judge. An attachment counts as a candidate when the extraction returns fewer than `enrich.minChars` characters; an extraction that fails is reported as a candidate with an `error` field, because the text layer could not be confirmed either way.
+
+The counts come from one scan of one library and are not stable to the character: the source records the same first attachment as 97,248 in `addon/prefs.js` and as 10.0 万 in the scan code's own comment. Treat them as an illustration of the gap rather than as reproducible fixtures — the gap either side of the threshold spans several orders of magnitude, which is why the threshold does not need tuning.
+
+### The `enrich.minChars` threshold
+
+The default is 1000 (`addon/prefs.js:16`, preference `extensions.zotero.jsbridge.enrich.minChars`), overridable per call with `--min-chars N`. Real scans come back at 0 or a few dozen junk characters — one complete scanned book, `2D9U3FZP`, measured 79 characters — while real papers extract tens of thousands. Nothing lives in between, so the threshold does not need tuning.
+
+### Measured cost, and why `--scan` prefilters but `--items` does not
+
+Measured over 1235 PDFs:
+
+| Call | Measured cost |
+| --- | --- |
+| `Zotero.PDFWorker.getFullText` | ~337 ms per PDF — about 7 minutes for the whole library |
+| `Zotero.Fulltext.getIndexedState` | 198 ms for all 1235 — a pure database read |
+
+`--scan` therefore prefilters on the index state: an attachment already `INDEXED` cannot need vision, and the expensive extraction set drops from 1235 to 200, about 67 seconds. The prefilter skips only `INDEXED` attachments; every other state still goes through `getFullText`, because the state cannot distinguish a missing text layer from a book with a few text-less pages. `--items` skips the prefilter entirely: naming an item means the caller wants that attachment's real answer, not an approximation of it. `--include-indexed` turns the prefilter off for `--scan` and is intended for debugging only.
+
+### Discovery flags
+
+| Flag | Effect | Default |
+| --- | --- | --- |
+| `--items KEY1,KEY2` | probe exactly these items; the CLI splits the comma list before sending, because the endpoint expects an array | — |
+| `--scan` | probe the whole user library | — |
+| `--include-indexed` | keep `INDEXED` attachments in the scan | off |
+| `--missing-only` / `--all-items` | skip items whose type-appropriate fields are already complete / include them | `--missing-only` |
+| `--min-chars N` | text-layer threshold for this call | `enrich.minChars`, 1000 |
+| `--limit N` / `--offset N` | page the candidate list | 100 / 0 |
+
+`--missing-only` (the default) drops items whose fields are already complete, since vision has nothing to add for them; the external rendering and model calls are the expensive part of the pipeline, so the filter saves the largest cost. It is independent of the text-layer test: an item with complete fields is not probed at all.
+
+### Discovery response
+
+| Key | Meaning |
+| --- | --- |
+| `ok` | success flag |
+| `minChars`, `missingOnly` | effective values used for this run |
+| `itemsProbed` | top-level bibliographic items considered; notes, standalone attachments, and annotations are filtered out |
+| `attsProbed` | PDF attachments considered on those items, before the index prefilter |
+| `skippedIndexed` | attachments dropped by the index prefilter |
+| `candidates` | number of candidate entries found |
+| `offset`, `limit`, `page`, `truncated` | pagination state; `page` carries the candidate rows |
+| `errorReport` | item keys that do not exist, when any were named |
+
+Each candidate row holds `item`, `type`, `title`, `missing` (the fields the item type expects but the item lacks, `addon/bootstrap.js:1350`), and `atts`. Each attachment row holds `akey`, `file` (the real file path), `chars`, `state`, `filename` and, on extraction failure, `error`. The file path is resolved through `getFilePathAsync`, which handles linked attachments and relative paths, so an external renderer can open it directly (`addon/bootstrap.js:1444`).
+
+### Why rendering is not part of the plugin
+
+Zotero exposes no headless PDF renderer: `Zotero.PDFRenderer` does not exist, and `Zotero.PDFWorker` has no render method. Pages have to be turned into images outside Zotero, with PyMuPDF or an equivalent tool, and the vision-model call belongs to the same external script. The endpoint hands out the resolved file path of every candidate attachment so that script has a starting point; [zotero-internals.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md) covers the surrounding Zotero API surface.
+
+## Mode B: writing back what vision read (dry-run by default)
+
+```bash
+python zoterojs.py enrich findings.json           # compare and report; no write
+python zoterojs.py enrich findings.json --yes     # apply the write ops
+```
+
+`--keep-going` continues the write phase past a per-item error instead of stopping at the first. `--loose` turns off the gates (`strict=false`; see [the three gates](#the-three-gates-front-matter-title-agreement-type-fit)); it exists to prove the gates work and must not be pointed at real data.
+
+### The `findings.json` format
+
+One entry per item:
+
+```json
+[{"item": "ABCD1234",
+  "pages": [{"p": 1, "type": "封面"}, {"p": 3, "type": "版权页CIP"}],
+  "title": "计算土力学", "publisher": "中国建筑工业出版社",
+  "year": "2019", "month": 3, "isbn": "978-7-112-00000-0",
+  "authors": ["朱百里"],
+  "evidence": "计算土力学/朱百里. —北京：中国建筑工业出版社，2019.3"}]
+```
+
+The CLI also accepts an object with a `findings` key holding the array. Field names must match the keys the endpoint reads; any other key is ignored.
+
+| findings.json key | Zotero field | Notes |
+| --- | --- | --- |
+| `item` (or `key`) | — | item key in the user library |
+| `pages` | — | gate 1 input; each page carries `p` and `type` |
+| `title` | title | filled when empty, extend-only otherwise |
+| `publisher` | publisher | on a `thesis` it is written to `university` instead |
+| `place` | place | |
+| `year`, `month` | date | four-digit year required; a month outside 1–12 is dropped |
+| `edition` | edition | |
+| `isbn` | ISBN | |
+| `series` | series | reported as `review`, never written |
+| `authors` | creators | written only when the item has no creators; otherwise reported as `same` |
+| `evidence` | — | quoted in `gatedReport`, first 300 characters |
+
+A page `type` matches the front-matter gate when it contains one of the gate's strings as a substring, so `版权页CIP` matches both 版权页 and CIP.
+
+### Field outcomes
+
+| Outcome | Condition | Action |
+| --- | --- | --- |
+| `new` | the library field is empty | write |
+| `extend` | the extracted title extends the library's — "从抛物线谈起" → "从抛物线谈起：混沌动力学引论" | write |
+| `same` | the two sides agree: identical values, or the library title already extends the extracted one | nothing |
+| `conflict` | both sides have values and the values differ | report only |
+| `review` | the field is `series` | report only |
+| `nofield` | the item type has no such field | nothing |
+
+Those six are the complete set of `kind` strings the endpoint emits (`bootstrap.js:1484-1508`). A gated finding is absent from the list by construction: it never reaches field comparison, so it carries no field row at all — it is held in `gatedReport` instead (see [the three gates](#the-three-gates-front-matter-title-agreement-type-fit)). Creators never conflict: an item that already has creators is reported as `same` and left untouched.
+
+### The title comparison: `extend` writes, the other direction does not
+
+Gate 2 compares titles after normalization: whitespace, CJK and ASCII punctuation, and dash characters (ASCII hyphen, em dash, fullwidth hyphen-minus) are stripped, the result is lowercased, and the two normalized titles match when either contains the other (`normForCompare`, `addon/bootstrap.js:1361`). The write decision is narrower and checks one direction only: the extracted title must extend the library's title, meaning the extracted string starts with the existing one, which is the `extend` outcome. When the library title already extends the extracted one, the outcome is `same` and nothing is written. This direction matters because a cover or title page that prints only the main title must not truncate a library title that carries the subtitle: the library holds "从抛物线谈起：混沌动力学引论", and a vision reading of a title page printing only "从抛物线谈起" leaves the longer title alone. An empty library title is filled as `new`; every other title disagreement is `conflict`.
+
+### The three gates: front matter, title agreement, type fit
+
+`strict` defaults to true. Every finding passes three checks before any field comparison happens; all three live in `gateFinding` (`addon/bootstrap.js:1397`).
+
+| Check | Function | Plain meaning | Reason string on failure |
+| --- | --- | --- | --- |
+| 1 front matter | `hasFrontMatter` (`addon/bootstrap.js:1367`) | the page types include one of 封面 / 书名页 / 扉页 / 版权页 / CIP / 题名页 | 没见到前置页（封面 / 书名页 / 版权页）—— 抽出来的很可能是正文里的参考文献或致谢 |
+| 2 title agreement | `titleFits` (`addon/bootstrap.js:1377`) | the extracted title and the item title match after normalization, one containing the other | 抽出的书名与条目标题对不上 |
+| 3 type fit | `fieldsFitType` (`addon/bootstrap.js:1392`) | a `journalArticle` carries no ISBN, publisher, edition, or series | 这是期刊论文，却抽出了出版社 / ISBN —— 读的多半是被它引用的那本书 |
+
+Gate 3 on a journal article: the item type has no place for a publisher or an ISBN, so an extracted one means the model read the book the article cites, not the article itself.
+
+### Two real hallucinations that justify the gates
+
+Both gates trace to two items from a real library, caught on 2026-09-12 in a run over 74 text-layer-free scanned attachments, 45 of which produced fields:
+
+- `82L9PCBI` — a journal article whose metadata came from a bibliography line in its own reference list, which the model reported as "版权页CIP" with a publisher and an ISBN attached. Gate 2 passes it: the article's title genuinely contains the title of the book it cites (弹性力学简明教程). Only gate 3 catches it.
+- `H2GCDM5B` — a publisher extracted from an acknowledgment sentence ("本书作者感谢清华大学出版社…"), with page types of only 正文 and 目录. Only gate 1 catches it.
+
+Title similarity alone does not stop this class of error. In the first case the title check passes by construction, because the citing title really does contain the cited title; gates 1 and 3 are what separate a genuine finding from a hallucination.
+
+### Gated findings and `strict=false`
+
+A finding that fails a gate lands in `gatedReport` with its item key, the item's title, the list of reasons, and the finding's `evidence` line (the first 300 characters of it), and it produces no ops. `strict=false` (`--loose`) turns the gates off; it exists to prove the gates work — the same input should then pass — and must not be pointed at real data.
+
+### `series` is reported but never written
+
+`REVIEW_ONLY_FIELDS = ["series"]` (`addon/bootstrap.js:1347`). The model reads any prominent line on a cover as a series; among 23 measured series values on a real library, the field held funding programs (国家自然科学基金重大项目), document types (中华人民共和国国家标准), and publication funds (水利部科技专著出版基金资助项目). A wrong series does not affect search, but it pollutes citation styles, so the endpoint reports it as `review` and writes nothing.
+
+### Writes reuse the `apply` write path
+
+`doEnrich` hands its ops to `doApply` with the tag `enrich` (`addon/bootstrap.js:1580`), so an `enrich` write gets a backup file tagged `enrich` when automatic backup is enabled, and the write is aborted if the backup fails (`addon/bootstrap.js:684`). The write report is the same shape `apply` produces, including its `collectionsLost` and `parentCollectionsGained` warnings when the shared path detects a collection-membership change. The shared path also supports `expect` preconditions; the ops that `enrich` generates do not set them.
+
+### Write-back response
+
+| Key | Meaning |
+| --- | --- |
+| `ok`, `strict` | status and the effective strictness |
+| `findings` | number of entries submitted |
+| `gated`, `gatedReport` | findings held back by the gates, each with `why` and `evidence` |
+| `checked`, `report` | findings compared field by field, including the ones whose only outcome is `same` |
+| `withOps` | findings that produced a write op |
+| `tally` | counts per outcome kind |
+| `errors`, `errorReport` | entries whose item key did not resolve |
+| `apply` | the result of the shared write path: `dryRun`, `applied`, `skipped`, `errors`, `report`, plus `backup` and `warning` when present |
+
+The report keeps entries whose fields are all `same`, so a caller can distinguish "compared and already equal" from "never processed" (`addon/bootstrap.js:1569`).
+
+### Pilot validation
+
+Replaying the 51 real vision outputs through the endpoint gave 36 pass / 15 gated, item-for-item identical to the Python prototype. The 5 divergent rows were all cases where the prototype was wrong: its snapshot had no `place` field and an inaccurate `date`.
+
+## See also
+
+- [endpoints.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) — the other endpoints, including `apply`, whose write path `enrich` reuses.
+- [merge.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md) — duplicate detection and merge behavior.
+- [zotero-internals.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md) — the Zotero APIs the plugin relies on.
+- [../README.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) — project overview and setup.
+
+
+==============================================================================
+# 源文件：docs/merge.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md
+==============================================================================
+
+# The `merge` endpoint: self-checked duplicate merging
+
+The `merge` endpoint merges duplicate Zotero items into a surviving `master` item, and only after eight self-checks confirm that each duplicate is the same work.
+
+The endpoint is `POST /zoterojs/merge`, takes a JSON body of `{"master": "<KEY>", "dups": ["<KEY>", ...], "dryRun": false}` (`bootstrap.js:1878-1890`), and requires the `X-ZoteroJS-Token` header. It counts as a write endpoint even for a dry run, so read-only mode rejects it with `403` (`bootstrap.js:1882`, `bootstrap.js:208-231`). Parameters and error codes are listed in [the endpoint reference](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md#the-merge-endpoint). This file describes plugin version 1.12.
+
+## The core rule: missing is not a conflict
+
+Two values conflict only when both sides carry one and the normalized values differ (`bootstrap.js:339`). A field that is absent on one item never blocks a merge:
+
+| `master` value | duplicate value | Outcome |
+| --- | --- | --- |
+| `12` | missing | pass — only one side has a value |
+| missing | `12` | pass — only one side has a value |
+| `12` | `12` | pass — equal |
+| `1–10` | `1-10` | pass — equal after normalization |
+| `Journal of Petrology` | `journal of petrology` | pass — case is normalized away |
+| `-` | `12` | pass — `-` normalizes to an empty string and counts as missing |
+| `12` | `13` | fail — both sides present and different |
+
+The rule matters because of online-first articles. An article published ahead of print legitimately has no volume, issue, or pages yet, while the record for the same article carries all three. A comparison that demands equality (`volume_master === volume_dup`) reads an empty value against a present one as a difference and rejects the genuine duplicate; the conflict rule ignores the pair unless both items supply a value, so the merge proceeds on the fields both items do have.
+
+## The eight compared fields
+
+The check keys are the literal strings returned in the `checks` object of every report entry (`bootstrap.js:373-382`); they are Chinese, and a caller matching on them must use the exact strings.
+
+| Key in `checks` | Compared value | Rule | Failure meaning |
+| --- | --- | --- | --- |
+| `标题相同` | `title` | equal after normalization | The titles differ: not the same work. |
+| `类型相同` | `itemType` (Zotero item-type ID) | strict equality, not normalized | The item types differ. |
+| `年份不冲突` | first four-digit run in the `date` field (`bootstrap.js:340`) | missing ≠ conflict | Both years are present and differ. |
+| `卷号不冲突` | `volume` | missing ≠ conflict | Both volumes are present and differ. |
+| `期号不冲突` | `issue` | missing ≠ conflict | Both issues are present and differ. |
+| `页号不冲突` | `pages` | missing ≠ conflict | Both page ranges are present and differ. |
+| `DOI 不冲突` | `DOI` | missing ≠ conflict | Both DOIs are present and differ. |
+| `ISBN 不冲突` | `ISBN` | missing ≠ conflict | Both ISBNs are present and differ. |
+
+`creators` and `edition` are not compared. The year is not the whole date field: `yearOf` takes the first four-digit sequence out of `date`, so `2021` and `2021-05-03` agree (`bootstrap.js:340`).
+
+## Normalization before comparison
+
+Every value is cast to a string, lower-cased, and stripped of a fixed noise set before any comparison (`strip`, `bootstrap.js:337`). Both the title equality check and the six conflict checks compare stripped values, so case, spacing, and punctuation differences do not separate duplicates.
+
+| Class | Characters removed |
+| --- | --- |
+| Whitespace | everything matched by JavaScript `\s` |
+| Dash punctuation | the whole Unicode `Pd` category: ASCII hyphen `-` (U+002D), hyphen (U+2010), non-breaking hyphen (U+2011), figure dash (U+2012), en dash `–` (U+2013), em dash `—` (U+2014), horizontal bar (U+2015), small hyphen-minus (U+FE63), fullwidth hyphen-minus (U+FF0D), and the rest of `Pd` |
+| Dashes outside `Pd`, listed individually | minus sign `−` (U+2212, category `Sm`), soft hyphen (U+00AD, `Cf`), hyphen bullet (U+2043, `Po`) |
+| Format characters | zero-width space (U+200B, `Cf`) |
+| ASCII punctuation | `_ . , ; : ( ) [ ] ! ?` |
+| Fullwidth and CJK punctuation | `（ ） 【 】 《 》 、 ， 。 ： ； ！ ？` |
+| Quotes and middle dot | `"` `'` `’` `·` |
+
+The same character class as written in the source, with the invisible members shown as escapes:
+
+```js
+// bootstrap.js:336, the same class with the invisible members written as escapes
+const NOISE = /[\s\p{Pd}\u2212\u00AD\u2043\u200B_.,;:()[\]（）【】《》"'’·、，。：；！？!?]/gu;
+```
+
+The dash handling is the part that matters most. Zotero's translators routinely deliver `1–10` with an en dash (U+2013) where the same range was typed `1-10` with ASCII U+002D — the code comment names CNKI, JSTOR, and Springer — and a literal string comparison reads those as different values, rejecting a genuine duplicate. An earlier version of the plugin listed only three hyphen characters (U+002D, U+2014, U+FF0D); the current regex matches the entire `Pd` category instead (`bootstrap.js:326-336`). The three characters outside `Pd` are listed by hand, and zero-width space (U+200B) is listed separately because JavaScript's `\s` does not match it although it is common in text copied from web pages (`bootstrap.js:331-335`).
+
+## The ISBN check as the backstop for same-title volumes
+
+Two volumes of the same textbook can carry identical titles and identical creators and differ only in ISBN and edition. Nothing else in the check list separates them: `creators` and `edition` are not compared fields, so if the pair reached the merge it would run, `master` would survive, the duplicate volume would go to the trash, and `Ctrl+Z` in Zotero would be the undo (`zoterojs.py:256`). The ISBN check is what stops that: when both volumes have an ISBN and the ISBNs differ, `ISBN 不冲突` is false and the duplicate is skipped with `自检未通过: ISBN 不冲突`. Both volumes stay in the library.
+
+The backstop has one boundary: if only one volume carries an ISBN, the missing ≠ conflict rule treats the pair as compatible, and the check does not fire.
+
+## `dryRun` reports without writing
+
+With `dryRun` set, the endpoint skips the `mergeItems` import entirely (`bootstrap.js:357-364`), takes no backup (`bootstrap.js:1893-1895`), and writes nothing; each duplicate that passes the checks is reported instead of merged, with `merged: false`, `dryRun: true`, and the attachment and collection counts the merge would consolidate (`bootstrap.js:388-393`). The dry run performs the same eight checks as a real merge.
+
+```bash
+python zoterojs.py merge MASTERKEY DUPKEY --dry-run
+python zoterojs.py merge MASTERKEY DUPKEY1 DUPKEY2 --dry-run
+```
+
+```python
+import zoterojs as zjs
+
+zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)   # self-check only
+zjs.merge("ABCD1234", ["EFGH5678"])                 # real merge
+```
+
+The dry run is opt-in. `dry_run` defaults to `False` in the Python client (`zoterojs.py:252`) and the endpoint coerces `data.dryRun` to a boolean (`bootstrap.js:1892`), so `python zoterojs.py merge MASTERKEY DUPKEY` and `zjs.merge("ABCD1234", ["EFGH5678"])` perform a real merge. The CLI accepts any number of duplicate keys (`merge MASTER DUP [DUP ...] [--dry-run]`, `zoterojs.py:548-555`); the Python wrapper accepts a single key or an iterable (`zoterojs.py:258-259`) and posts `{"master": ..., "dups": [...], "dryRun": ...}` (`zoterojs.py:260-261`).
+
+A dry run still passes the write gate: read-only mode returns `403`, a disabled endpoint returns `404`, and the master switch returns `503` (`bootstrap.js:208-231`). The switches are listed in [the settings table](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md#settings).
+
+## The shape of the response
+
+A passing dry run returns the following object (`bootstrap.js:402-409`):
+
+```json
+{
+  "ok": true,
+  "dryRun": true,
+  "master": { "key": "ABCD1234", "title": "Example title" },
+  "report": [
+    {
+      "key": "EFGH5678",
+      "merged": false,
+      "dryRun": true,
+      "checks": {
+        "标题相同": true,
+        "类型相同": true,
+        "年份不冲突": true,
+        "卷号不冲突": true,
+        "期号不冲突": true,
+        "页号不冲突": true,
+        "DOI 不冲突": true,
+        "ISBN 不冲突": true
+      },
+      "attachments": 2,
+      "collections": 1
+    }
+  ],
+  "attachmentsAfter": 1
+}
+```
+
+| Top-level field | Value |
+| --- | --- |
+| `ok` | `true` once the report loop runs; `false` when the call aborts before it — an unusable `master` returns `error` instead of `report` (`bootstrap.js:354-355`), and a malformed request or a failed backup never reaches the loop (`bootstrap.js:1888-1890`, `bootstrap.js:684-694`). |
+| `dryRun` | the request flag coerced to boolean. |
+| `master` | `{ "key", "title" }` of the item that would survive. |
+| `report` | one entry per key in `dups`, in request order (`bootstrap.js:367`). |
+| `attachmentsAfter` | `master`'s attachment count after the loop (`master.getAttachments().length`, `bootstrap.js:407`). |
+| `backup` | present on a real merge when the automatic-backup pref is on: the descriptor from `backupBefore("merge")` (`bootstrap.js:684-694`, added at `bootstrap.js:1895-1897`). A dry run takes no backup. |
+
+| Report-entry field | Present when | Value |
+| --- | --- | --- |
+| `key` | always | the duplicate's item key |
+| `merged` | always | `true` only after the merge call returned |
+| `checks` | the item exists and is not in the trash | the eight booleans above |
+| `dryRun` | a dry-run entry that passed the checks | `true` |
+| `attachments` | a dry-run pass, or a real merge | attachment count of `master` + duplicate before the merge |
+| `collections` | a dry-run pass | collection count of `master` + duplicate |
+| `why` | a skipped entry | the reason string |
+
+The actual merge is `mergeItems(master, [dup])` from `chrome://zotero/content/mergeItems.mjs`, with a fallback to `Zotero.Items.merge(master, [dup])` when that module cannot be imported (`bootstrap.js:357-364`, `bootstrap.js:396`). Each duplicate is merged into the same `master` one at a time, so `attachmentsAfter` reflects the accumulation.
+
+## What happens when a check fails: the duplicate is skipped, the batch continues
+
+A failed check skips that one duplicate; it does not abort the call. The loop `continue`s and the remaining duplicates are still checked and merged (`bootstrap.js:383-387`). A `mergeItems` exception is caught per duplicate and reported the same way (`bootstrap.js:398-400`).
+
+| `why` value | Trigger | Reference |
+| --- | --- | --- |
+| `条目不存在` | the duplicate key is not in the user library | `bootstrap.js:369` |
+| `已在回收站` | the duplicate is already in the trash | `bootstrap.js:370` |
+| `自检未通过: <names>` | one or more checks false; failed names joined with `、` in the order the checks are defined | `bootstrap.js:383-386` |
+| `mergeItems 报错: <message>` | the merge call threw; the loop continues | `bootstrap.js:398-400` |
+
+Two conditions abort the whole request before any item is touched: `master` missing or already in the trash returns `{"ok": false, "error": ...}` with no report (`bootstrap.js:354-355`), and a request without `master` or without `dups` returns `400` (`bootstrap.js:1888-1890`). On a real merge with backups enabled, a failed backup also aborts the write before anything is merged (`bootstrap.js:684-694`).
+
+## See also
+
+- [`endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) — parameters, response fields, and error codes for the `merge` endpoint and the other seven endpoints.
+- [`enrich.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md) — the fill-only metadata enrichment endpoint and the gates that guard it.
+- [`../README.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) — installation, settings, and the endpoint table.
+
+
+==============================================================================
+# 源文件：docs/zotero-internals.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md
+==============================================================================
+
+# Zotero Internals: Platform Traps
+
+A measured reference of the Zotero and Firefox platform traps this project hit while being built — async data APIs in Zotero 10, the misleading `onlyTopLevel` filter, the `LIKE` guard inside Firefox, manifest and endpoint-registration requirements, and preference-pane binding rules — so other Zotero plugin authors do not repeat them.
+
+Plugin authors are the intended audience, with the maintainers of this project a close second. Every entry here is a behaviour that was measured against a live Zotero 10.0.2 library or read from the platform's shipped source; none of it is inferred from documentation. Each trap is stated as a claim, followed by the evidence that establishes it and the form that works instead.
+
+## Zotero 10's data APIs are async
+
+`Zotero.Items.getAll(1)` returns a **Promise**, not an array. Accessing `.length` on it silently yields `undefined`, and it serializes to `{}` — no error, only wrong data.
+
+| API | Signature |
+| --- | --- |
+| `Zotero.Items.getAll` | `async (libraryID, onlyTopLevel, includeDeleted, asIDs)` |
+| `Zotero.Items.getDeleted` | `async (libraryID, asIDs, days, limit)` |
+| `Zotero.Items.getAsync` | `async (ids, options)` |
+| `Zotero.Items.get` | sync — `(ids)` |
+| `Zotero.Items.getByLibraryAndKey` | sync — `(libraryID, key, options)` |
+
+The serializer in this plugin flags un-awaited promises explicitly instead of returning a silent `{}`:
+
+```text
+"[Promise 未 await：Zotero 10 里 getAll / getDeleted / getAsync 等都是 async]"
+```
+
+A top-level `return somePromise` is awaited automatically; what breaks is a promise *nested* inside a returned object. Awaiting is the safe default.
+
+## `onlyTopLevel: true` does not mean bibliographic items
+
+`getAll`'s top-level filter joins two tables:
+
+```js
+'SELECT A.itemID FROM items A' +
+' LEFT JOIN itemNotes B USING (itemID)' +
+' LEFT JOIN itemAttachments C ON (C.itemID=A.itemID)' +
+' WHERE B.parentItemID IS NULL AND C.parentItemID IS NULL'
+```
+
+There is **no `itemAnnotations` join**, so every highlight and underline in the library counts as a top-level item. Measured on a real library:
+
+| | |
+| --- | --- |
+| `(await Zotero.Items.getAll(1, true)).length` | **11 231** |
+| …of which annotations | 10 030 |
+| …standalone attachments / notes | 2 / 2 |
+| **actual bibliographic items** | **1 197** |
+
+The performance cost is the obvious half: finding the 1 197 items that matter means 10 030 wasted `getAttachments()` calls, and measured, that loop does not finish in usable time. The worse half is that **the number lies** — a tool reporting `itemsProbed: 11231` looks like it scanned the library while it really looked at a tenth of it, and wrong numbers are worse than slow ones.
+
+Filter by type:
+
+```js
+for (const it of await Zotero.Items.getAll(1, true, false, false)) {
+  if (it.isAttachment() || it.isNote() || it.isAnnotation()) continue;
+  // ...a bibliographic item
+}
+```
+
+A hand-written `itemTypeID` comparison is a trap of its own: `annotation`'s `itemTypeID` is **1**, which reads like "default / ordinary item", so a hand-rolled check tends to wave the annotations straight through.
+
+## The `LIKE` guard is in Firefox, not Zotero
+
+```js
+// ✗ rejected: "Please enter a LIKE clause with bindings"
+"... WHERE value LIKE '%x%'"
+// ✓ the pattern has to be bound
+"... WHERE value LIKE ?", ['%x%']
+```
+
+The guard lives in **Firefox's** `modules/Sqlite.sys.mjs`, not in Zotero's code, so searching Zotero's own `omni.ja` for it finds nothing. It is a regex:
+
+```js
+/\bLIKE\b\s(?![@:?])/i
+```
+
+The semantics: `LIKE`, whitespace, and then a character that is not `@`, `:`, or `?` — only `LIKE ?` / `LIKE :n` / `LIKE @n` pass. It is also stricter than "no quotes": a column name or a subquery after `LIKE` is rejected too. And it is **unconditional** — omitting the params argument does not slip past it (`params = null` is only a default; the check runs on the next line).
+
+Two related facts for anyone writing queries against the Zotero database: `deleteLog` **does not exist** in Zotero 10 (`no such table`) — `deletedItems` is the authoritative trash record. This plugin binds every `LIKE` pattern it writes (`ia.path LIKE ?`, with `'storage:%'` in the parameter array).
+
+## A `type: "extension"` manifest must declare `id`, `update_url`, and `strict_max_version`
+
+A manifest must declare all three of these under `applications.zotero`, or packaging fails with `packagingError` → `Extension is invalid` (`Extension.sys.mjs:1874-1883`):
+
+```json
+"applications": {
+  "zotero": {
+    "id": "...",
+    "update_url": "...",              // ← the one everybody forgets
+    "strict_max_version": "..."
+  }
+}
+```
+
+The install-failure message is a single hardcoded string. `addon-install-disabled`, `addon-install-blocked`, and `addon-install-failed` all render the same "may not be compatible with this version of Zotero" text (`standalone.addonInstallationFailed.body`). It does *not* indicate a version problem — check the Error Console for the real cause. A missing `update_url` produces exactly this misleading message.
+
+## Endpoint registration requires a constructor, not an object
+
+`Zotero.Server.Endpoints[path]` must be assigned a **constructor**, not an object — server-side the endpoint is instantiated with `new this.endpoint()`. `init` must have exactly one formal parameter so that it takes the object-argument branch; that parameter is the server's `options` object (`server.js:479`: `{ method, pathname, pathParams, searchParams, headers, data }`).
+
+The endpoints in this plugin are plain prototype objects wrapped in a constructor before assignment:
+
+```js
+function Ctor(proto) {
+  const F = function () {};
+  F.prototype = proto;
+  return F;
+}
+```
+
+## Preference panes are less forgiving than the docs suggest
+
+Five things this project got wrong before reading `chrome/content/zotero/xpcom/preferencePanes.js`:
+
+- The pane is an XHTML **fragment**, not a document. XUL is the default namespace, so HTML tags need an explicit prefix (`<html:input>`, `<html:h2>`).
+- `register()` given no `id` mints `plugin-pane-<random>-<pluginID>`. A second `register()` therefore **does not throw** — it quietly adds a *second* pane to the sidebar. Give an explicit `id` and `unregister()` first, or users accumulate duplicate panes on every hot reload.
+- Panes registered by a plugin are removed on shutdown by Zotero's own `Plugins.addObserver({ shutdown })`, filtered by `pluginID`. That observer does not run on every hot-reload path — `startup()` can be called again without `shutdown()` having run.
+- `preference="extensions.zotero.foo"` on a control is bound by Zotero's own prefs code (`_syncFromPref` / `_syncToPrefOnModify`) with no JS needed, but the name must be **fully qualified** and must have a default in `prefs.js`, or the control appears to work and writes to a pref nobody reads.
+- **The pane uses fully-qualified names; JS must use short ones.** The two sides reach the same pref through different paths:
+
+  ```js
+  // preferences.js:447 / :474 — the pane passes global=true
+  Zotero.Prefs.get(preference, true);
+  Zotero.Prefs.set(preference, value, true);
+
+  // Zotero.Prefs.get — everything else, prefix added for you
+  pref = global ? pref : ZOTERO_CONFIG.PREF_BRANCH + pref;   // "extensions.zotero."
+  ```
+
+  Mixing the two **fails silently**: `Zotero.Prefs.set` *creates* a missing pref, so `set('extensions.zotero.x', v)` followed by a `get` reads back `v` while code reading the short name still sees the default. This is the trap that produced a false "the rotation is broken" diagnosis; `test_bridge.js` now records any misuse and fails on it.
+
+## Changing an item's type does not detach its collections — setting `parentItemID` does
+
+The first half is a fabrication story: the test stub's `Item.setType` used to clear `collections`, "because changing the type detaches the item". That behaviour was invented, the test asserted the invented behaviour, and it passed — until the same operation ran against a real library and `collectionItems` turned out not to move at all. The lesson: **a stub shaped wrong makes its tests self-confirming.**
+
+The live measurement is precise: a `presentation` → `document` → `presentation` round-trip leaves `collectionItems` untouched, and the source agrees — `setType` touches only `itemData` / `creators`. What detaches a collection is the database trigger on `collectionItems` (a collection cannot hold an item that has a parent), so setting `parentItemID` is the actual mechanism, and the only one verified live.
+
+That mechanism has a second half, on the other item. Parenting a standalone attachment transfers its collections to the *parent* (`item.js:1944`, "remove from any collections where it existed previously and add parent instead"), so the attachment leaves a collection and the parent joins it. A collection diff therefore has to watch both items: the `apply` endpoint watches the parent as well, and its dry run predicts the transfer. The parent's save passes `skipDateModifiedUpdate`, so its `dateModified` never moves — the transfer cannot be found afterwards by looking for recently-changed items.
+
+## See also
+
+- [Development](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md) — the test harness, the mutation suite, and the build.
+- [Endpoints](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) — the endpoint reference.
+- [README](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) — install, usage, and settings.
+
+
+==============================================================================
+# 源文件：README.zh-CN.md
+# https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.zh-CN.md
+==============================================================================
+
+# Zotero JS Bridge
+
+[English](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) | **中文**
+
+在**正在运行的 Zotero 进程内**执行 JavaScript 的插件：把八个本地 HTTP 端点挂在 Zotero 自带的服务器上，让脚本代劳合并条目、查询库、批量改元数据、备份，而不必每次打开 **工具 → 开发者 → Run JavaScript** 手贴代码。
+
+[![release](https://img.shields.io/github/v/release/Sum-su/zotero-js-bridge?label=release)](https://github.com/Sum-su/zotero-js-bridge/releases/latest)
+[![CI](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/LICENSE)
+[![Zotero](https://img.shields.io/badge/Zotero-7%2B-brightgreen.svg)](https://www.zotero.org/)
+
+## 为什么需要它
+
+Zotero 的插件 API **没有进程外通道**。凡是连接器 API 覆盖不到的——合并重复条目、搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。本插件挂在 Zotero 本来就在跑的 `127.0.0.1:23119` 服务器上，在那里注册八个 JSON 端点。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
+
+> [!WARNING]
+> 这些端点能在 Zotero 里执行**任意 JavaScript**，可读写你整个库。任何能读到 token 文件的进程都能删掉你的库。这是个人自动化工具，不是加固过的服务——装之前请先读[安全模型](#安全模型)。
+
+## 环境要求
+
+| | |
+| --- | --- |
+| Zotero | 7 到 10（`strict_min_version` `6.999`，`strict_max_version` `10.99.99`）；开发与验证均在 **Zotero 10.0.2** 上完成 |
+| Python | 3.8+（只为自带的客户端；协议本身是八个 JSON 端点，任何 HTTP 客户端都能用） |
+
+## 安装
+
+1. 从 [Releases](https://github.com/Sum-su/zotero-js-bridge/releases/latest) 下载 `zotero-js-bridge.xpi`。
+2. 在 Zotero 里打开 **工具 → 插件 → ⚙ → Install Add-on From File…**
+3. 选中那个 `.xpi`。引导式扩展会热重载，通常不用重启；若端点没响应，重启一次 Zotero。
+
+Zotero 会生成一个新 token 写到 `<数据目录>/zoterojs-token.txt`，客户端自己会找。插件在 **工具 → 首选项 → JS Bridge** 加一个面板，里面有开关、token 操作、**立即备份**按钮和自检。**改动立即生效，不用重启。**
+
+## 快速上手
+
+```bash
+python zoterojs.py ping                              # 健康检查，不需要 token
+python zoterojs.py exec "return Zotero.Libraries.userLibraryID"
+python zoterojs.py query --title 物理化学 --limit 20   # 结构化查询，不用写 SQL
+python zoterojs.py doctor                            # 只读库体检
+python zoterojs.py merge 主条目KEY 重复KEY --dry-run   # 带自检的合并
+python zoterojs.py apply ops.json                    # 不给 --yes 就是演练
+python zoterojs.py enrich --scan                     # 哪些 PDF 该送去 OCR/视觉
+python zoterojs.py backup                            # VACUUM INTO + 轮转
+```
+
+`query` 打印的 `key` 可以直接喂给 `merge` 和 `apply`，整条流水线是**查询 → 演练 → 确认 → 写**，中间不用手工转换。
+
+> [!IMPORTANT]
+> **三个写命令的默认值并不一样，而这个差别关系到安全。**
+> `apply` 和 `enrich` 的写回不给 `--yes` 就是演练；
+> **`merge` 是例外：不给 `--dry-run` 就是真合并。** 它在 Python 客户端里的
+> `dry_run` 参数默认同样是 `False`。要演练请显式加上 `--dry-run`。
+
+同一套能力也可以当库用：
+
+```python
+import zoterojs as zjs
+
+zjs.ping()
+zjs.exec("return Zotero.Items.get(1).getField('title')")
+zjs.query(title="岩石", limit=20)                            # 只读
+zjs.doctor()                                                 # 只读
+zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)
+zjs.apply([{"item": "ABCD1234", "set": {"date": "2021"}}])   # 默认就是演练
+zjs.enrich(scan=True)                                        # 只读，找候选
+zjs.enrich(findings=[...])                                   # 写回
+zjs.backup()
+```
+
+完整的命令行参数与 Python 函数签名见 [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md)。
+
+## 端点
+
+| 路径 | 方法 | 写？ | 用途 |
+| --- | --- | :---: | --- |
+| `/zoterojs/ping` | GET | | 版本、Zotero 版本、端点清单、开关的实时状态。**唯一免 token 的端点。** |
+| `/zoterojs/exec` | POST | ✅ | 执行 JS，支持顶层 `await` 与 `return`。注入 `Zotero`、`Services`、`ChromeUtils`、`Components`、`Cu`、`Ci`、`Cc`、`PathUtils`、`IOUtils`、`OS` 和 `log()`。 |
+| `/zoterojs/merge` | POST | ✅ | 八项自检之后合并重复条目。**默认不是演练**——要演练得显式传 `dryRun`。 |
+| `/zoterojs/logs` | GET、POST | | 读 Zotero 的错误控制台与调试输出。 |
+| `/zoterojs/query` | GET、POST | | 走 Zotero 自己的 `Search` 做结构化只读查询，**不写 SQL**。 |
+| `/zoterojs/doctor` | GET、POST | | 只读库体检；**默认不联网**。 |
+| `/zoterojs/apply` | POST | ✅ | 批量改元数据，默认演练，自动报集合归属差分。 |
+| `/zoterojs/enrich` | GET、POST | ✅ | 把视觉模型从扫描件上读到的补进空字段。**只填空，永不覆盖。** |
+
+`backup` **不是端点**——它是面板上的按钮，外加一个「写操作前自动备份」的开关。
+
+写端点另有一层保护：只读模式让 `exec` / `merge` / `apply` / `enrich` 一律返 `403`，**连演练形式也拒**。参数、响应形状与错误码详见 [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md)。
+
+`User-Agent` 以 `Mozilla/` 开头、或带 `Origin` 头的请求，会在到达插件之前被 **Zotero 自己的 CSRF 守卫**拦掉。命令行客户端不受影响；从浏览器侧调用需要带上 `x-zotero-connector-api-version`——这一点对所有 Zotero 插件端点都成立。
+
+深入参考：
+
+- [`docs/merge.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md) —— 八项自检、值归一化、ISBN 硬防线。
+- [`docs/enrich.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md) —— 两种模式、只填空的规矩、三道闸和它们各自对应的那次真实错误。
+
+## 设置
+
+**工具 → 首选项 → JS Bridge。** pref 是在**请求路径上现读**的，所以改完对下一次调用就生效，不用重启，也不用重新注册端点。
+
+| Pref（`extensions.zotero.jsbridge.…`） | 默认 | 作用 |
+| --- | --- | --- |
+| `enabled` | `true` | 设 `false` → 八个端点全返 `503` |
+| `readonly` | `false` | 设 `true` → `exec` / `merge` / `apply` / `enrich` 返 `403`，读的口子照开 |
+| `endpoint.ping` … `endpoint.enrich` | `true` | 设 `false` → 该路径返 `404` |
+| `enrich.minChars` | `1000` | 抽出的字符数低于此值，就认为这个 PDF 没有文本层 |
+| `limit.responseKB` | `1500` | 响应上限，钳制在 10–20000 |
+| `backup.enabled` | `false` | 设 `true` → 每次 `merge` / `apply` / `enrich` 写入前先备份 |
+| `backup.keep` | `5` | 保留份数，钳制在 1–200 |
+
+`ping` 会报出开关的实时状态，调用方**可以问，不用猜**：`disabled` 列出当前被关掉的路径，`readonly` 是只读开关的当前值。
+
+面板里还有 token 操作（复制 / 重新生成 / 重写文件）、**立即备份**按钮，以及一个**自检**按钮——报告八个端点是否注册、开关当前是什么、token 文件在不在。自检**故意不联网**：它不会向 `127.0.0.1:23119` 发请求，因为 Zotero 自己的 CSRF 守卫会把它拦掉，那样一旦失败也说明不了任何问题。
+
+## 安全模型
+
+威胁模型是**单用户桌面机**。由此带来的后果应当被明确接受：
+
+- **token 是全权凭证。** 它存在 pref `extensions.zotero.jsbridge.token` 里，并镜像到 `<数据目录>/zoterojs-token.txt`。任何能读到这个文件（或读到你的 pref）的东西，都能在 Zotero 里执行任意代码并毁掉你的库。
+- **仅本机可访问，但没有沙箱。** Zotero 只绑 `127.0.0.1`，所以端点从网络不可达；但本机上任何拿到 token 的进程都能调。
+- **`exec` 故意不设限。** 它就是 `new AsyncFunction(...)` 套你的代码。这正是它的用途——它不是沙箱，也不假装是。
+- **无 TLS。** 流量是 loopback 明文。
+
+现有的缓解：除 `ping` 外都要 token；对存储的 token 做**常数时间比较**；可配置的响应上限；总开关 + 八个端点开关 + 只读模式；`shutdown()` 时清理端点；三个写端点默认演练；写入前自动备份，且**备份失败就中止这次写**。
+
+**这些开关是「限制爆炸半径」，不是「安全边界」。** 它们管的是*你自己*跑的脚本能捅多大娄子——把终端交给一个没那么小心的东西时有用。它们挡不住已经拿到 token 的人：那个人可以把 pref 改回去。
+
+两处需要说准的地方：
+
+- **只读模式是拒绝服务，不是沙箱。** 它**不解析你的代码**。`exec` 能写出多少种副作用，静态判不全，所以它不假装能判，而是把写入口整个关掉（`exec`、`merge`、`apply`、`enrich`，以及 `logs --clear`），读的口子（`ping`、`logs`、`query`、`doctor`）留着。`apply` 和 `enrich` **连演练形式也被拦**：只读的意思是「这个端点不可用」，而不是「你可以排练」。`enrich` 在两verb 上都算写，包括它的候选发现模式——因为 `--scan` 会把几百个 PDF 的全文抽一遍，要跑好几分钟。
+- **总开关是在请求路径上拦，不是不注册端点。** 停用之后面板还在，而那正是唯一能把它打开的地方——一个在停用时卸掉自己设置界面的插件，就再也无法从 Zotero 里启用回来了。
+
+重新生成 token 会**立即吊销**旧的：pref 和 `zoterojs-token.txt` 一起重写，仍持旧 token 的客户端开始收到 `403`。
+
+彻底移除：卸载插件，然后删掉 pref `extensions.zotero.jsbridge.token` 和 `zoterojs-token.txt` 文件。
+
+## 已知限制
+
+- **`enrich` 不渲染 PDF，也不调视觉模型。** Zotero 没有暴露无头 PDF 渲染器（`Zotero.PDFRenderer` 不存在，`Zotero.PDFWorker` 也没有 render 方法）。整页转图片要靠外部脚本，调模型同样在外部。端点只做两件本地事：**判断哪些附件需要视觉**，和**把视觉读到的写回去**。
+- **变异验证还没有覆盖 `enrich`。** `mutate.py` 里那 22 个变异体都早于这个端点，所以「测试全绿 + 22/22 全抓」并不等于最新代码也被变异验证盖住了。它目前靠重放真实视觉输出来背书。见 [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md)。
+- **`debug` 日志源默认是空的。** 这不是坏了：它只在 `extensions.zotero.debug.store` 打开时才记录，而 Zotero 启动读完就把该 pref 设回 `false`，所以每次重启只能拿到一个会话的输出。`console` 源则永远有货。
+- **只读模式对 `exec` 除了「拒绝执行」之外没有任何约束**——理由见上面的安全模型。
+
+## 开发
+
+```bash
+node test_bridge.js              # 测试套件，不需要装 Zotero
+python mutate.py                 # 把每处修复改回坏的样子，看测试会不会红
+python build.py                  # 打出 xpi
+python build.py --bump           # 先升版本号
+python build.py --install        # 打包后装进正在运行的 Zotero
+python check_backup.py [DIR]     # 只读打开每份备份，验完整性
+```
+
+测试把真实的 `addon/bootstrap.js` 载入 Node `vm` 上下文（Zotero 全局对象用 stub 替掉），然后直接驱动端点构造函数。CI 会跑测试、变异验证和一次打包检查。
+
+贡献者文档——测试脚手架设计、变异验证的思路、stub 的保真要求、版本约定、发布顺序规则：见 [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md)。
+
+## 文档索引
+
+| 文件 | 内容 |
+| --- | --- |
+| [`docs/endpoints.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/endpoints.md) | 八个端点的完整参考：参数、响应、错误码 |
+| [`docs/merge.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/merge.md) | 合并自检、归一化、ISBN 硬防线 |
+| [`docs/enrich.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/enrich.md) | 扫描件补全：两种模式、三道闸、实测数据 |
+| [`docs/zotero-internals.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/zotero-internals.md) | Zotero / Firefox 平台陷阱，全部实测而非推测 |
+| [`docs/development.md`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/docs/development.md) | 测试脚手架、变异验证、打包、CI、版本约定 |
+| [`llms.txt`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/llms.txt) | 给语言模型用的机器可读索引；全文单文件版在 [`llms-full.txt`](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/llms-full.txt) |
+| [README.md](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/README.md) | English |
+
+## 许可证
+
+[MIT](https://raw.githubusercontent.com/Sum-su/zotero-js-bridge/main/LICENSE)

@@ -39,8 +39,8 @@ jobs:
       # 至少保证能编译过、import 得动
       - name: Byte-compile the Python client and scripts
         run: |
-          python -m py_compile zoterojs.py build.py make_icon.py check_backup.py mutate.py
-          python -c "import zoterojs, build, mutate"
+          python -m py_compile zoterojs.py build.py make_icon.py check_backup.py mutate.py build_llms.py
+          python -c "import zoterojs, build, mutate, build_llms"
 
       # 打包顺带校验 manifest 声明的图标确实进了包
       - name: Build xpi
@@ -53,6 +53,17 @@ jobs:
           if ! git diff --quiet -- updates.json; then
             echo "::error::updates.json 与 manifest 版本不一致，跑一下 python build.py 并提交"
             git diff -- updates.json
+            exit 1
+          fi
+
+      # llms-full.txt 是 build_llms.py 从 README/docs 拼出来的。它一旦漂了，
+      # 模型读到的就是旧文档 —— 而那是**看不出来**的那类错误，没人会去核对一份
+      # 拼好的副本。所以和 updates.json 一样，重新生成后必须没有 diff。
+      - name: llms-full.txt 必须和源文档同步
+        run: |
+          python build_llms.py
+          if ! git diff --quiet -- llms-full.txt; then
+            echo "::error::llms-full.txt 与 README/docs 不一致，跑一下 python build_llms.py 并提交"
             exit 1
           fi
 
