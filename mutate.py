@@ -97,9 +97,9 @@ MUTANTS = [
      "test_bridge.js"),
     # --- storage 端点 / v1.13 新增与重写的体检项 ---
     # 这九条里：六条打在 storage 端点（含它用的 walkFiles），两条打在 tagVariants，
-    # 一条打在 apply --tags 的 autoBecomeManual。**orphanStorage 自己的逻辑没有变异体**
-    # ——它的内容/缓存拆分和 deep 目前只被功能测试盖着，没被"改坏了必须变红"盖着。
+    # 一条打在 apply --tags 的 autoBecomeManual。
     # 写注释时别再把它算成"新体检项"：v1.12 就有它了，v1.13 是重写。
+    # orphanStorage **自身**逻辑的变异体原先一条都没有——见下面那组（2026-09-13 补的）。
     ("★ 遍历文件时把 stat 的 type 字面量写错（2026-09-13 真机上就是这么拿到一个自信的 0）",
      "      if (st.type === \"directory\") { stack.push(p); continue; }\n",
      "      if (st.type === \"directory\") { stack.push(p); continue; }\n"
@@ -128,6 +128,40 @@ MUTANTS = [
     ("标签变体把自动行也算成手动行（type 那一列的 CASE 写反）",
      "    if (Number(r.t) === 0) manual += Number(r.n); else auto += Number(r.n);",
      "    if (true) manual += Number(r.n); else auto += Number(r.n);"),
+
+    # --- orphanStorage 自身的逻辑（2026-09-13 补）---
+    # 上面那条注释里记的缺口就是它：此前 orphanStorage 只有功能测试兜着，没有
+    # "改坏了必须变红"的底线。这一组对着 DEFAULT_STORAGE 的三个目录（1 个活、2 个孤儿）
+    # 逐项盯着它的输出字段，锚点都在 checkOrphanStorage / orphanRedundancy 里。
+    #
+    # **没给"丢掉 8 位长度过滤"写变异体。** 夹具里三个目录名恰好都是 8 位，
+    # 把那句 filter 删掉，scanned 照样是 3 —— 变异体抓不住就等于没有，写上去只会
+    # 在 mutate.py 里冒充一条覆盖。要盖它得先往夹具里塞一个非 8 位的杂物，
+    # 那会改动 scanned/count 的一串断言；等真有需要时再一起做。
+    ("缓存文件的正则不再匹配（.zotero-* 被当成正文算进体积）",
+     "const CACHE_FILE_RE = /^\\.zotero-(?:ft-cache|reader-state)/;",
+     "const CACHE_FILE_RE = /^zzz-never-matches-(?:ft-cache|reader-state)/;"),
+    ("内容的字节数不减缓存（把小体积也算进正文体积）",
+     "    contentBytes: bytes - cacheBytes,",
+     "    contentBytes: bytes,"),
+    ("内容的文件数不减缓存",
+     "    contentFiles: files - cacheFiles,",
+     "    contentFiles: files,"),
+    ("扫过的目录数报成孤儿数（「占几个目录」和「几个是垃圾」混了）",
+     "    scanned: dirs.length,",
+     "    scanned: orphans.length,"),
+    ("孤儿判定写反（在用的目录被当成垃圾，孤儿反而不算）",
+     "  const orphans = dirs.filter(n => !live.has(n));",
+     "  const orphans = dirs.filter(n => live.has(n));"),
+    ("按扩展名分类时只数文件不累字节",
+     "      b.files++; b.bytes += f.size;",
+     "      b.files++; b.bytes += 0;"),
+    ("不给 deep 也去跑全量比对",
+     "  if (asBool(p && p.deep)) out.deep = await orphanRedundancy(dir, live, orphanFiles);",
+     "  out.deep = await orphanRedundancy(dir, live, orphanFiles);"),
+    ("deep 的大小比对写反（和活库撞上的算成没撞上）",
+     "    if (sizes.has(f.size)) { dup++; dupBytes += f.size; } else { uniq++; uniqBytes += f.size; }",
+     "    if (!sizes.has(f.size)) { dup++; dupBytes += f.size; } else { uniq++; uniqBytes += f.size; }"),
 ]
 
 

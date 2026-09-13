@@ -1197,7 +1197,7 @@ Gate 3 on a journal article: the item type has no place for a publisher or an IS
 
 ### Two real hallucinations that justify the gates
 
-Both gates trace to two items from a real library, caught on 2026-09-12 in a run over 74 text-layer-free scanned attachments, 45 of which produced fields:
+The gates trace to two items from a real library, caught on 2026-09-12 in a run over 74 text-layer-free scanned attachments, 45 of which produced fields:
 
 - `82L9PCBI` — a journal article whose metadata came from a bibliography line in its own reference list, which the model reported as "版权页CIP" with a publisher and an ISBN attached. Gate 2 passes it: the article's title genuinely contains the title of the book it cites (弹性力学简明教程). Only gate 3 catches it.
 - `H2GCDM5B` — a publisher extracted from an acknowledgment sentence ("本书作者感谢清华大学出版社…"), with page types of only 正文 and 目录. Only gate 1 catches it.
