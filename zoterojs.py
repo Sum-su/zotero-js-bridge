@@ -10,8 +10,12 @@
     zjs.doctor()                                # 一键库体检，全部只读
     zjs.merge("ABCD1234", ["EFGH5678"], dry_run=True)
     zjs.apply([{"item": "ABCD1234", "set": {"date": "2021"}}])   # 默认只演练
+    zjs.apply([], tags=[{"from": "deep learning", "to": "Deep Learning"}])  # 标签归并
     zjs.enrich(scan=True)                                     # 谁需要视觉补全（只读）
     zjs.enrich(findings=[...])                                # 把视觉读到的写回去
+    zjs.storage_list()                                        # 隔离批次（只读）
+    zjs.storage_quarantine()                                  # 孤儿目录进隔离区；默认只演练
+    zjs.storage_relocate(dir="D:/下载")                        # 断链外链附件重新指路；默认只演练
     zjs.backup()
 
 命令行：
@@ -26,12 +30,20 @@
                              [--where 'date=isAfter:2020'] [--fields DOI,ISBN]
                              [--limit N] [--no-collections]
     python zoterojs.py doctor [CHECK ...] [--all] [--days N]
-    python zoterojs.py apply ops.json [--yes] [--keep-going]
+    python zoterojs.py apply ops.json [--yes] [--keep-going] [--tags TAGS]
+    python zoterojs.py apply --tags TAGS [--yes] [--keep-going]
     python zoterojs.py enrich [--items KEY,KEY] [--scan] [--include-indexed]
                              [--missing-only/--all-items] [--min-chars N]
                              [--limit N] [--offset N]
     python zoterojs.py enrich findings.json [--yes] [--keep-going] [--loose]
+    python zoterojs.py storage list
+    python zoterojs.py storage quarantine [--yes --confirm]
+    python zoterojs.py storage restore STAMP [--yes --confirm]
+    python zoterojs.py storage relocate DIR [--yes --confirm]
     python zoterojs.py backup
+
+storage 的写操作搬的是文件系统里的东西，数据库备份盖不住它：真写要同时给 --yes 和 --confirm，
+少一个都不写（对应 dryRun:false + confirm:true，服务端那两道闸是分开的）。
 """
 
 from __future__ import annotations
@@ -313,18 +325,22 @@ def query(title: str = None, doi: str = None, isbn: str = None, creator: str = N
     return _get("/zoterojs/query", params, timeout=timeout)
 
 
-DOCTOR_CHECKS = ["orphanStorage", "unfiled", "attachmentTitle",
-                 "duplicateFilenames", "duplicates", "trashWriteback", "sync"]
+DOCTOR_CHECKS = ["orphanStorage", "linkedFiles", "tagVariants", "unfiled",
+                 "attachmentTitle", "duplicateFilenames", "duplicates",
+                 "trashWriteback", "sync"]
 
 
 def doctor(checks=None, all_checks: bool = False, days: int = 30,
            timeout: int = 300) -> dict:
     """一键库体检，全部只读。
 
-    checks 里可选的：orphanStorage（孤儿附件目录）/ unfiled（未分类）/
-    attachmentTitle（标题停在导入器默认值的附件）/ duplicateFilenames（同一父条目下的
-    同名附件）/ duplicates（同 DOI / ISBN）/ trashWriteback（回收站里还在被改写的条目）/
-    sync（**要连 zotero.org，默认不跑**，得点名要）
+    checks 里可选的：orphanStorage（孤儿附件目录，体积按**内容/缓存**分开报 ——
+    缓存是 Zotero 自己能再生的）/ linkedFiles（外链附件断链；修法是 storage 端点的
+    relocate，不是重建附件）/ tagVariants（只差大小写或标点的标签；归并走 apply 的
+    tags）/ unfiled（未分类）/ attachmentTitle（标题停在导入器默认值的附件）/
+    duplicateFilenames（同一父条目下的同名附件）/ duplicates（同 DOI / ISBN）/
+    trashWriteback（回收站里还在被改写的条目）/ sync（**要连 zotero.org，默认不跑**，
+    得点名要）
 
     不传 checks 就跑除 sync 之外的全部 —— 一个「体检」按钮不该悄悄往外发请求。
     """
@@ -336,9 +352,9 @@ def doctor(checks=None, all_checks: bool = False, days: int = 30,
     return _get("/zoterojs/doctor", params, timeout=timeout)
 
 
-def apply(ops, dry_run: bool = True, stop_on_error: bool = True,
+def apply(ops, dry_run: bool = True, stop_on_error: bool = True, tags=None,
           timeout: int = 300) -> dict:
-    """批量改元数据。**默认 dry_run=True** —— 先看它打算改什么，再真改。
+    """批量改元数据 / 归并标签。**默认 dry_run=True** —— 先看它打算改什么，再真改。
 
     ops 是列表，每项形如：
 
@@ -362,9 +378,22 @@ def apply(ops, dry_run: bool = True, stop_on_error: bool = True,
     整个转给父条目（item.js:1944-1967），所以父条目会凭空多出几个集合。
     报告里对应 parentItem / parentCollectionsGained，演练时是 wouldGiveParent。
     挂的时候两个条目都要看，只盯着被写的那一个会漏掉一半。
+
+    还可以传 tags 做**库级标签归并**（同一个端点、同一套干湿跑纪律，dry_run 也管它）：
+
+        zjs.apply([], tags=[{"from": "deep learning", "to": "Deep Learning"}])
+
+    只归并标签时可以 ops=[]。里面走的是 Zotero.Tags.rename，**自动标签会被转成手动标签**
+    （SQL 里写死 type=0），逐条报在 autoBecomeManual，warning 里也会再提一次；
+    目标名已经存在不算错，会并成一条（mergesIntoExisting）。回包里多出 tags（逐条报告）/
+    tagsMerged / tagsErrors，只给 tags 时 backup.reason 是 "tags" —— 事后翻备份目录
+    一眼能看出这次写是谁干的。
     """
+    if isinstance(tags, dict):
+        tags = [tags]
     return _post("/zoterojs/apply",
-                 {"ops": list(ops), "dryRun": dry_run, "stopOnError": stop_on_error},
+                 {"ops": list(ops), "tags": list(tags) if tags else None,
+                  "dryRun": dry_run, "stopOnError": stop_on_error},
                  timeout=timeout)
 
 
@@ -447,6 +476,71 @@ def backup(timeout: int = 600) -> dict:
     return r
 
 
+def storage_list(timeout: int = 120) -> dict:
+    """列出隔离批次（只读）。回 root / count / stamps[]。
+
+    stamps 每项 {stamp, dirs, bytes, mb, at}，manifest.json 读不到时只有 stamp 和
+    manifest="读不到"。storage_restore 要的 stamp 就是这里的 stamp。
+
+    注意这个端点在**只读模式**下是整个不通的（连 list 也算）—— 同一个入口能搬文件，
+    面板上的开关和只读模式按「写」拦它。
+    """
+    return _get("/zoterojs/storage", {"op": "list"}, timeout=timeout)
+
+
+def storage_quarantine(dry_run: bool = True, confirm: bool = False,
+                       timeout: int = 300) -> dict:
+    """把孤儿附件目录搬进 jsbridge-quarantine/<stamp>/。**默认只演练。**
+
+    只搬「storage/ 下有、items 表里没有对应附件」的那些 8 位 key 目录，
+    **只隔离不删除** —— 判据是字节数，只能说明可能是副本，不构成证据，所以留了 restore 这条路。
+
+    ⚠️ 真写（dry_run=False）**还要再给 confirm=True**，两个缺一不可：这个端点动的是文件系统，
+    而自动备份（VACUUM INTO）只覆盖数据库，一次搬错没有备份可回。少给 confirm 服务端回
+    HTTP 400（响应体里是 ok:false，故意的），别把它当成「演练完成」。
+
+    演练回 {dirs, files, bytes, mb, sample}；真写多回 stamp / quarantined / failed /
+    failedSample / root，外加一条现成的 undo（照它跑 restore 就搬回来了）。
+    """
+    return _post("/zoterojs/storage",
+                 {"op": "quarantine", "dryRun": dry_run, "confirm": confirm},
+                 timeout=timeout)
+
+
+def storage_restore(stamp: str, dry_run: bool = True, confirm: bool = False,
+                    timeout: int = 300) -> dict:
+    """把某一批隔离目录照 manifest.json 搬回 storage/。**默认只演练，真写同样两道闸**
+    （dry_run=False + confirm=True，少一个就不写）。
+
+    stamp 从 storage_list() 来。演练回 {stamp, dirs, bytes}；真写多回 restored / failed /
+    failedSample；没搬全时回 partial（manifest 留着，可以再来一次 —— 目标已存在就不硬搬）。
+    """
+    return _post("/zoterojs/storage",
+                 {"op": "restore", "stamp": stamp, "dryRun": dry_run,
+                  "confirm": confirm},
+                 timeout=timeout)
+
+
+def storage_relocate(dir: str, dry_run: bool = True, confirm: bool = False,
+                     timeout: int = 300) -> dict:
+    """按文件名把断链的外链附件重新指回去。**默认只演练，真写同样两道闸**
+    （dry_run=False + confirm=True，少一个就不写）。
+
+    只认 basename **全等**，不做模糊匹配（模糊匹配会「修」出一个错路径，比不修更糟）；
+    只在你给的 dir 里找，不扫全盘。dir 读不了会直接报错，不会静默回「扫了 0 个」。
+
+    回 {searched, scanned, broken, matched, plan:[{key, want, found}]}；真写多回
+    relocated / done / failed / failedSample。
+
+    外链附件本来就不该有 storage 目录（见 doctor 的 linkedFiles），所以这一路和
+    quarantine / restore 是两回事，只是都落在「文件到底在哪」上。
+    """
+    return _post("/zoterojs/storage",
+                 {"op": "relocate", "dir": dir, "dryRun": dry_run,
+                  "confirm": confirm},
+                 timeout=timeout)
+
+
 def _split(v: str):
     return [s.strip() for s in str(v).split(",") if s.strip()]
 
@@ -469,6 +563,29 @@ def _json_arg(v: str):
         op, value = rest.split(":", 1)
         out.append({"field": field.strip(), "op": op.strip(), "value": value.strip()})
     return out
+
+
+def _tags_arg(v: str):
+    """`--tags '[{"from":"deep learning","to":"Deep Learning"}]'`。
+    值以 [ 或 { 开头就当场当 JSON 解，否则当成一个 JSON 文件路径（`--tags tags.json`）；
+    文件里写成 {"tags": [...]} 也收，跟 apply 的 ops.json 一个路子。"""
+    s = str(v).strip()
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            val = json.loads(s)
+        except ValueError as e:
+            raise SystemExit(f"--tags 不是合法 JSON：{e}")
+    else:
+        try:
+            with open(s, encoding="utf-8") as f:
+                val = json.load(f)
+        except OSError as e:
+            raise SystemExit(f"--tags 读不了 {s}：{e}")
+        except ValueError as e:
+            raise SystemExit(f"--tags 文件不是合法 JSON：{e}")
+    if isinstance(val, dict):
+        val = val.get("tags", val)
+    return val if isinstance(val, list) else [val]
 
 
 def _parse_flags(args, value_flags, bool_flags):
@@ -497,7 +614,8 @@ def _parse_flags(args, value_flags, bool_flags):
 
 
 _APPLY_MARK = {"applied": "改", "would-change": "会改", "no-change": "不动",
-               "skipped": "跳过", "error": "出错"}
+               "skipped": "跳过", "error": "出错",
+               "merged": "归并", "would-merge": "会归并"}
 
 
 def _print_apply_report(res):
@@ -523,10 +641,38 @@ def _print_apply_report(res):
                   f"（父子条目原有归属转过去的，用 removeFromCollection 摘掉）")
             print(f"         父条目集合 {r.get('parentCollectionsBefore')} → "
                   f"{r.get('parentCollectionsAfter')}")
-    print(f"\n改 {res['applied']} · 跳过 {res['skipped']} · 出错 {res['errors']}"
-          + ("（演练，未写入；确认后加 --yes）" if res["dryRun"] else ""), file=sys.stderr)
+    # 标签归并（apply 的 tags）另成一段 —— 它动的不是条目字段，塞进上面逐条差分里会串味
+    for t in (res.get("tags") or []):
+        mark = _APPLY_MARK.get(t.get("status"), t.get("status"))
+        n = f"（{t['items']} 条）" if t.get("items") is not None else ""
+        print(f"{mark:4} 标签 {t.get('from')!r} → {t.get('to')!r}{n}")
+        if t.get("mergesIntoExisting"):
+            print(f"       并入已有标签（那边已经有 {t['mergesIntoExisting']} 条）")
+        if t.get("autoBecomeManual"):
+            print(f"       ⚠ {t['autoBecomeManual']} 条自动标签会转成手动"
+                  f"（Zotero.Tags.rename 写死 type=0，转完不再自动管理）")
+        if t.get("why"):
+            print(f"       ⚠ {t['why']}")
+    tail = f"\n改 {res['applied']} · 跳过 {res['skipped']} · 出错 {res['errors']}"
+    if res.get("tags"):
+        tail += (f" · 标签归并 {res.get('tagsMerged', 0)}"
+                 f" · 标签出错 {res.get('tagsErrors', 0)}")
+    print(tail + ("（演练，未写入；确认后加 --yes）" if res["dryRun"] else ""),
+          file=sys.stderr)
     if res.get("warning"):
         print(res["warning"], file=sys.stderr)
+
+
+def _print_storage_failures(res):
+    """storage 三路真正写下去的公共尾巴：失败样例 + 部分还原的提示。
+    和 apply 的报告一样，各分支自己印一遍迟早会分叉。"""
+    for f in (res.get("failedSample") or []):
+        who = f.get("dir") or f.get("key") or "?"
+        print(f"       ⚠ 失败 {who}：{f.get('why')}", file=sys.stderr)
+    if res.get("failed"):
+        print(f"失败 {res['failed']} 个", file=sys.stderr)
+    if res.get("partial"):
+        print(f"⚠ {res['partial']}", file=sys.stderr)
 
 
 def _main(argv):
@@ -642,17 +788,33 @@ def _main(argv):
     elif cmd == "apply":
         # 默认 dry-run，真写必须显式 --yes。批量改元数据不该有一次「手滑就改了」的机会。
         path = argv[2] if len(argv) > 2 and not argv[2].startswith("--") else None
-        if not path:
-            print("用法: python zoterojs.py apply ops.json [--yes] [--keep-going]\n"
+        if not path and "--tags" not in argv:
+            print("用法: python zoterojs.py apply ops.json [--yes] [--keep-going] [--tags TAGS]\n"
+                  "      python zoterojs.py apply --tags TAGS [--yes] [--keep-going]\n"
                   "  ops.json 是 apply() 的 ops 列表，照它上面的格式写\n"
+                  "  --tags 是标签归并列表 [{from, to}, ...]（也可以给 JSON 文件路径），"
+                  "只归并标签时 ops.json 可以不写\n"
                   "  默认只演练，确认无误再加 --yes 真写", file=sys.stderr)
             return 1
-        with open(path, encoding="utf-8") as f:
-            ops = json.load(f)
-        if isinstance(ops, dict):
-            ops = ops.get("ops", ops)
+        ops = []
+        if path:
+            with open(path, encoding="utf-8") as f:
+                ops = json.load(f)
+            if isinstance(ops, dict):
+                ops = ops.get("ops", ops)
+        tags = None
+        if "--tags" in argv:
+            i = argv.index("--tags")
+            if i + 1 >= len(argv):
+                print("--tags 后面要给一个 JSON 文件路径或 JSON 本身", file=sys.stderr)
+                return 1
+            try:
+                tags = _tags_arg(argv[i + 1])
+            except SystemExit as e:
+                print(e, file=sys.stderr)
+                return 1
         res = apply(ops, dry_run="--yes" not in argv,
-                    stop_on_error="--keep-going" not in argv)
+                    stop_on_error="--keep-going" not in argv, tags=tags)
         _print_apply_report(res)
     elif cmd == "enrich":
         rest = argv[2:]
@@ -720,6 +882,90 @@ def _main(argv):
             if res.get("truncated"):
                 print(f"\n还有更多（候选 {res['candidates']} 条只显示了 "
                       f"{len(res['page'])} 条），用 --limit / --offset 翻页", file=sys.stderr)
+    elif cmd == "storage":
+        rest = argv[2:]
+        op = rest[0] if rest and not rest[0].startswith("--") else None
+        # 真写要**两个独立的旗子**：--yes 对应 dryRun:false，--confirm 对应 confirm:true。
+        # 不能让一个旗子同时代表两者 —— 这个端点搬的是文件，数据库备份盖不住它，
+        # 服务端那两道闸在这里必须原样保留：少一个要么只演练，要么被拒。
+        write_flags = {"--yes": ("dry_run", False), "--confirm": ("confirm", True)}
+        usage = ("用法: python zoterojs.py storage list\n"
+                 "      python zoterojs.py storage quarantine [--yes --confirm]\n"
+                 "      python zoterojs.py storage restore STAMP [--yes --confirm]\n"
+                 "      python zoterojs.py storage relocate DIR [--yes --confirm]\n"
+                 "  默认只演练。真写要同时给 --yes 和 --confirm"
+                 "（对应 dryRun:false + confirm:true，缺一个都不写）。")
+        if op not in ("list", "quarantine", "restore", "relocate"):
+            print(usage, file=sys.stderr)
+            return 1
+        dry_hint = "（演练，未写入）确认无误后真写：--yes --confirm 两个都要"
+        if op == "list":
+            kw, err = _parse_flags(rest[1:], {}, {})
+            if err:
+                print(f"{err}\n{usage}", file=sys.stderr)
+                return 1
+            res = storage_list()
+            for s in res["stamps"]:
+                if s.get("manifest"):
+                    print(f"{s['stamp']}  警告：manifest 读不到，restore 没得照搬")
+                else:
+                    print(f"{s['stamp']}  {s['dirs']:4} 个目录  {s['mb']:9.1f} MB  "
+                          f"{s.get('at') or ''}")
+            if not res["stamps"]:
+                print(f"没有隔离批次（{res['root']} 还是空的）")
+            print(f"共 {res['count']} 批 · {res['root']}", file=sys.stderr)
+            if res.get("note"):
+                print(res["note"], file=sys.stderr)
+        elif op == "quarantine":
+            kw, err = _parse_flags(rest[1:], {}, write_flags)
+            if err:
+                print(f"{err}\n{usage}", file=sys.stderr)
+                return 1
+            res = storage_quarantine(**kw)
+            if res.get("dryRun"):
+                print(f"演练：{res['dirs']} 个孤儿目录 / {res['files']} 个文件 / "
+                      f"{res['mb']} MB 会被搬进隔离区")
+                for e in res.get("sample") or []:
+                    print(f"       {e['dir']}  {e['files']:4} 个文件  {e['bytes']} 字节")
+                print(dry_hint, file=sys.stderr)
+            else:
+                print(f"已隔离 {res['quarantined']} 个目录 → {res['root']}")
+                if res.get("undo"):
+                    print(f"要撤销就照这条来：{res['undo']}", file=sys.stderr)
+            _print_storage_failures(res)
+        else:
+            # restore 要 stamp，relocate 要 dir —— 都是位置参数，写法和 merge 一样。
+            label = "STAMP" if op == "restore" else "DIR"
+            if len(rest) < 2 or rest[1].startswith("--"):
+                print(f"用法: python zoterojs.py storage {op} {label} [--yes --confirm]",
+                      file=sys.stderr)
+                return 1
+            kw, err = _parse_flags(rest[2:], {}, write_flags)
+            if err:
+                print(f"{err}\n{usage}", file=sys.stderr)
+                return 1
+            if op == "restore":
+                res = storage_restore(rest[1], **kw)
+                if res.get("dryRun"):
+                    print(f"演练：会把 {res['stamp']} 的 {res['dirs']} 个目录 / "
+                          f"{res['bytes'] / 1048576:.1f} MB 搬回 storage/")
+                else:
+                    print(f"已还原 {res['restored']} 个目录（{res['stamp']}）")
+            else:
+                res = storage_relocate(rest[1], **kw)
+                print(f"在 {res['searched']} 扫了 {res['scanned']} 个文件："
+                      f"断链 {res['broken']} 个，按文件名对上 {res['matched']} 个")
+                if res.get("dryRun"):
+                    for p in res.get("plan") or []:
+                        print(f"       {p['key']}  {p.get('want') or '(路径为空)'} → "
+                              + (p["found"] if p.get("found") else "没找到"))
+                else:
+                    for d in res.get("done") or []:
+                        print(f"       已指向 {d['key']} → {d['to']}")
+                    print(f"重新指向 {res['relocated']} 个附件")
+            if res.get("dryRun"):
+                print(dry_hint, file=sys.stderr)
+            _print_storage_failures(res)
     elif cmd == "backup":
         res = backup()
         print(f"已备份 {(res['bytes'] / 1048576):.1f} MB · {res['ms']} ms")

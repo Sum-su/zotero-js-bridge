@@ -35,7 +35,8 @@ const PREF_ENRICH_MIN = "jsbridge.enrich.minChars";
 const TOKEN_FILE = "zoterojs-token.txt";
 const BACKUP_DIR = "jsbridge-backups";
 const PATHS = ["/zoterojs/ping", "/zoterojs/exec", "/zoterojs/merge", "/zoterojs/logs",
-  "/zoterojs/query", "/zoterojs/doctor", "/zoterojs/apply", "/zoterojs/enrich"];
+  "/zoterojs/query", "/zoterojs/doctor", "/zoterojs/apply", "/zoterojs/enrich",
+  "/zoterojs/storage"];
 
 /* 每个端点一个开关。面板上勾掉哪个，哪个当场返回 404 —— 闸门在请求路径上现读 pref，
  * 所以改完立刻生效，既不用重启也不用重新注册端点。 */
@@ -48,6 +49,7 @@ const PREF_EP = {
   "/zoterojs/doctor": "jsbridge.endpoint.doctor",
   "/zoterojs/apply": "jsbridge.endpoint.apply",
   "/zoterojs/enrich": "jsbridge.endpoint.enrich",
+  "/zoterojs/storage": "jsbridge.endpoint.storage",
 };
 
 /* 读 pref 的三条规矩（都踩过）：
@@ -839,26 +841,206 @@ async function doQuery(p) {
 
 /* 检查项都是这台机器上真踩过的坑，判据照抄 docs/07 和 docs/08 —— 不是凭空想的规则。 */
 
-const DOCTOR_CHECKS = ["orphanStorage", "unfiled", "attachmentTitle",
+const DOCTOR_CHECKS = ["orphanStorage", "linkedFiles", "tagVariants", "unfiled", "attachmentTitle",
   "duplicateFilenames", "duplicates", "trashWriteback", "sync"];
 
 // 默认只跑本地检查。sync 要连 zotero.org，藏在一个"体检"按钮后面不合适 —— 想要就点名要。
 const DOCTOR_DEFAULT = DOCTOR_CHECKS.filter(c => c !== "sync");
 
-async function checkOrphanStorage() {
+const mb = (b) => Math.round(b / 1048576 * 10) / 10;
+
+/* 目录遍历。两个实测过的坑，都吃过：
+ *   - `Zotero.File.iterateDirectory` 返回的东西**不可直接 for...of**（实测抛
+ *     "is not iterable"），所以这里自己用 IOUtils.getChildren 递归。
+ *   - `IOUtils.stat().type` 对普通文件是 **"regular"**，不是 "regularFile"。
+ *     写成后者不会抛错，只是所有文件都不匹配 —— 于是体积统计出一个**自信的 0**。
+ *     2026-09-13 就是这么被骗过一次的。两处都有 mutant 盯着（见 mutate.py）。 */
+const CACHE_FILE_RE = /^\.zotero-(?:ft-cache|reader-state)/;
+
+/* `strict` 只管**根目录**：根读不了就抛出去。
+ * 子树读不了照旧跳过 —— 根是调用方给的，它错了是调用方的问题（典型是把路径打错），
+ * 静默返回 0 个文件会让 relocate 报出「扫了 0 个、修了 0 个」，看着像"没事"，
+ * 而不是"你给我的路径是错的"。子树属于数据，里面的权限或损坏问题不该让整件事失败。
+ * （2026-09-13：不传 strict 时，`relocate dir=Z:\根本不存在` 会回 200 + scanned:0。） */
+async function walkFiles(root, strict) {
+  const out = [];
+  const stack = [root];
+  while (stack.length) {
+    const cur = stack.pop();
+    let kids;
+    try { kids = await IOUtils.getChildren(cur); }
+    catch (e) { if (strict && cur === root) throw e; continue; }
+    for (const p of kids || []) {
+      let st;
+      try { st = await IOUtils.stat(p); } catch (e) { continue; }
+      if (st.type === "directory") { stack.push(p); continue; }
+      const name = PathUtils.filename(p);
+      out.push({ path: p, name: name, size: Number(st.size) || 0, cache: CACHE_FILE_RE.test(name) });
+    }
+  }
+  return out;
+}
+
+function extOf(name) {
+  const m = String(name).match(/\.([A-Za-z0-9]{1,8})$/);
+  return m ? m[1].toLowerCase() : "(无扩展名)";
+}
+
+async function checkOrphanStorage(p) {
   const live = new Set(await Zotero.DB.columnQueryAsync(
     "SELECT key FROM items WHERE itemID IN (SELECT itemID FROM itemAttachments)") || []);
   const dir = PathUtils.join(Zotero.DataDirectory.dir, "storage");
   let kids = [];
   try { kids = await IOUtils.getChildren(dir); } catch (e) { return { error: String(e.message || e) }; }
-  const dirs = kids.map(p => PathUtils.filename(p)).filter(n => n && n.length === 8);
+  const dirs = kids.map(f => PathUtils.filename(f)).filter(n => n && n.length === 8);
   const orphans = dirs.filter(n => !live.has(n));
-  return {
+
+  /* 只走孤儿那几棵子树，**不遍历整个 storage/**。理由是这两条，都是 2026-09-13 实测的：
+   *   · 孤儿那几棵树一共 447 个文件 / 3.53 GB / 220 ms；
+   *     全量是 3820 个文件 / 13.67 GB / ~2.0 s —— 九倍的 I/O，而活目录里的内容
+   *     **对这份输出毫无贡献**（活目录不可能出现在孤儿清单里）。
+   *   · 需要活目录内容的只有 deep，所以它单独开关。
+   * 别在这里写「全量遍历会超时」：那是错的，全量稳定在 2 秒（跑了三遍：2023/2013/2054 ms）。
+   * 更要命的是 deep 走的就是全量，等于说一个每次调用都在做的动作会超时。 */
+  let files = 0, bytes = 0, cacheFiles = 0, cacheBytes = 0;
+  const byExt = {};
+  const orphanFiles = [];
+  for (const n of orphans) {
+    for (const f of await walkFiles(PathUtils.join(dir, n))) {
+      files++; bytes += f.size;
+      orphanFiles.push(f);
+      if (f.cache) { cacheFiles++; cacheBytes += f.size; continue; }
+      const k = extOf(f.name);
+      const b = byExt[k] || (byExt[k] = { files: 0, bytes: 0 });
+      b.files++; b.bytes += f.size;
+    }
+  }
+
+  const out = {
     count: orphans.length,
     scanned: dirs.length,
+    files: files,
+    bytes: bytes,
+    mb: mb(bytes),
+    // 缓存那一组也要报出来。只报 content 的话，两个数之间的差是个**算不出来的数**，
+    // 而"差在哪"恰恰是这一项唯一的用处（缓存可以再生，内容不行）。
+    cacheFiles: cacheFiles,
+    cacheBytes: cacheBytes,
+    cacheMB: mb(cacheBytes),
+    contentFiles: files - cacheFiles,
+    contentBytes: bytes - cacheBytes,
+    contentMB: mb(bytes - cacheBytes),
+    byExt: byExt,
     sample: orphans.slice(0, 20),
     note: "孤儿目录 = storage/ 下有、items 表里没有对应附件。这个数**只增不减**是正常的：" +
-      "历史遗留会一直留着。要看的是**本次操作前后有没有变多**，别把基数当故障。",
+      "历史遗留会一直留着。要看的是**本次操作前后有没有变多**，别把基数当故障。\n" +
+      "体积那一组按**内容**和**缓存**分开算：`.zotero-ft-cache` / `.zotero-reader-state` " +
+      "是 Zotero 自己可再生出来的，内建的 Zotero.FullText.purgeOrphanedContent 就管这个；" +
+      "真正占地方的是 contentMB。\n" +
+      "内建**没有**任何东西清理剩下的那些文件：Zotero 10 里没有 Zotero.FileIntegrity，" +
+      "Zotero.Schema.integrityCheck 查的是数据库 schema，不碰文件系统。",
+  };
+
+  if (asBool(p && p.deep)) out.deep = await orphanRedundancy(dir, live, orphanFiles);
+  return out;
+}
+
+/* deep：拿孤儿里的文件去和**在用的附件文件**比字节数。判据故意用字节数而不是文件名 ——
+ * 这个库里同名未必同一份、同一份未必同名：`Ch1_微生物建造研究进展.pdf` 在 8 个孤儿目录里
+ * 各有一份，而库里的真本叫「史 等 - 2025 - 微生物建造研究进展与趋势.pdf」。
+ * 字节数相同**只说明可能是副本，不构成证据** —— 报出来的是线索，不是结论。 */
+async function orphanRedundancy(storageDir, live, orphanFiles) {
+  const sizes = new Set();
+  for (const n of live) {
+    for (const f of await walkFiles(PathUtils.join(storageDir, n))) {
+      if (!f.cache) sizes.add(f.size);
+    }
+  }
+  let dup = 0, dupBytes = 0, uniq = 0, uniqBytes = 0;
+  for (const f of orphanFiles) {
+    if (f.cache) continue;
+    if (sizes.has(f.size)) { dup++; dupBytes += f.size; } else { uniq++; uniqBytes += f.size; }
+  }
+  return {
+    duplicateBySize: dup, duplicateMB: mb(dupBytes),
+    unmatchedBySize: uniq, unmatchedMB: mb(uniqBytes),
+    note: "判据是**字节数相同**，只能说可能是副本，不构成证据；" +
+      "unmatchedBySize 那一批在库里找不到同尺寸的文件，删之前要单独看。",
+  };
+}
+
+/* 外链附件。linkMode 2 = LINKED_FILE（指向磁盘上的一个文件），3 = LINKED_URL。
+ * 这两种**本来就不该有 storage 目录** —— 所以「附件条目没有 storage 目录」里混着这两类，
+ * 把它们当成"文件丢了"是误报。
+ * LINKED_URL 不测可达性：那要连网，体检默认不连网（和 sync 一个道理）。 */
+const LINK_MODE_LINKED_FILE = 2;
+const LINK_MODE_LINKED_URL = 3;
+
+async function checkLinkedFiles() {
+  const ids = await Zotero.DB.columnQueryAsync(
+    "SELECT i.itemID FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID " +
+    "WHERE ia.linkMode IN (?, ?)", [LINK_MODE_LINKED_FILE, LINK_MODE_LINKED_URL]);
+  const items = await Zotero.Items.getAsync((ids || []).map(Number));
+  const broken = [], good = [], urls = [];
+  for (const it of items || []) {
+    if (!it) continue;
+    const rec = { key: it.key, path: String(it.attachmentPath || "") };
+    const par = it.parentItemID ? Zotero.Items.get(it.parentItemID) : null;
+    if (par) rec.title = par.getField("title");
+    if (it.attachmentLinkMode === LINK_MODE_LINKED_URL) { urls.push(rec); continue; }
+    let f = null;
+    try { f = await it.getFilePathAsync(); } catch (e) { f = null; }
+    (f ? good : broken).push(rec);
+  }
+  return {
+    total: (items || []).length,
+    brokenCount: broken.length,
+    broken: broken.slice(0, 20),
+    okCount: good.length,
+    ok: good.slice(0, 10),
+    urlCount: urls.length,
+    urls: urls.slice(0, 10),
+    note: "外链附件（linkMode 2/3）本来就没有 storage 目录，**别把它算进孤儿里**。" +
+      "broken 的修法是换掉附件指向的路径，不是重建附件 —— 用 storage 端点的 relocate。",
+  };
+}
+
+/* 大小写/标点只差一点点的标签。归一用现成的 strip()：它本来就是回答"两个值算不算同一个"
+ * 的，标签是同一个问题，没必要再写一套。
+ * ⚠️ Zotero 自己的 `tags.nameNormalized` 指望不上 —— 实测这个库 3467 个标签里 3440 行是 NULL，
+ * 那一列基本没在维护，所以归一必须自己算。
+ * manual / auto 分开报是有用的：Zotero.Tags.rename 的 SQL 里写死了 `type=0`，
+ * 归并会把自动标签**转成手动标签**。实测这个库的大小写重复**全部**是自动标签。 */
+async function checkTagVariants() {
+  const rows = await Zotero.DB.queryAsync(
+    "SELECT t.tagID AS id, t.name AS name, count(it.itemID) AS n, " +
+    "sum(CASE WHEN it.type = 0 THEN 1 ELSE 0 END) AS manual, " +
+    "sum(CASE WHEN it.type = 1 THEN 1 ELSE 0 END) AS auto " +
+    "FROM tags t LEFT JOIN itemTags it ON it.tagID = t.tagID GROUP BY t.tagID");
+  const groups = new Map();
+  for (const r of rows || []) {
+    const k = strip(r.name);
+    if (!k) continue;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push({
+      name: r.name, items: Number(r.n) || 0,
+      manual: Number(r.manual) || 0, auto: Number(r.auto) || 0,
+    });
+  }
+  const dup = [...groups.values()].filter(g => g.length > 1);
+  let auto = 0, manual = 0;
+  for (const g of dup) for (const t of g) { auto += t.auto; manual += t.manual; }
+  return {
+    groups: dup.length,
+    variants: dup.reduce((a, g) => a + g.length, 0),
+    autoTagRows: auto,
+    manualTagRows: manual,
+    sample: dup.slice(0, 10),
+    note: "每一组只差大小写或标点。修法是 apply 端点的 {tags:[{from,to},…]}，" +
+      "dry-run 默认开。\n" +
+      "**归并会把自动标签转成手动标签** —— Zotero.Tags.rename 的 SQL 里写死 type=0。" +
+      "自动标签重新导入会被 Zotero 再补回来，转手动之后就归你管了；" +
+      "这未必是坏事，但要知情。autoTagRows 就是会被转掉的行数。",
   };
 }
 
@@ -1068,7 +1250,9 @@ async function doDoctor(p) {
   const out = { ok: true, checks: {}, ran: want };
   for (const c of want) {
     try {
-      if (c === "orphanStorage") out.checks[c] = await checkOrphanStorage();
+      if (c === "orphanStorage") out.checks[c] = await checkOrphanStorage(p);
+      else if (c === "linkedFiles") out.checks[c] = await checkLinkedFiles();
+      else if (c === "tagVariants") out.checks[c] = await checkTagVariants();
       else if (c === "unfiled") out.checks[c] = await checkUnfiled();
       else if (c === "attachmentTitle") out.checks[c] = await checkAttachmentTitle(p);
       else if (c === "duplicateFilenames") out.checks[c] = await checkDuplicateFilenames();
@@ -1083,8 +1267,213 @@ async function doDoctor(p) {
   }
   out.ms = Date.now() - t0;
   out.note = "体检**只读**，不改任何东西。没点名的检查没跑：" +
-    "sync 要连 zotero.org，默认不跑，要的话传 {checks:[\"sync\"]} 或 {all:true}。";
+    "sync 要连 zotero.org，默认不跑，要的话传 {checks:[\"sync\"]} 或 {all:true}。" +
+    "orphanStorage 传 {deep:true} 会额外扫全部在用附件的体积来估冗余，慢得多，默认不跑。";
   return out;
+}
+
+/* ---------------- 存储卫生：storage ---------------- */
+
+/* 这个端点动的是**文件系统**，而备份机制（VACUUM INTO）只覆盖数据库 —— 一次 move 出错没有
+ * 备份可回。所以纪律比 apply 更严：dry-run 默认开，真写还要再传 `confirm:true`，
+ * 而且写之前先落一份 manifest.json，记下每个目录的原位置和体积，restore 靠它整体搬回。
+ *
+ * **隔离而不是删除**：实测这个库 288 个孤儿 PDF 有 115 个在库内找不到同尺寸的文件
+ * （含一本 87 MB 的教科书），"删"这个动作有真实的误伤面。
+ * 判据是字节数相同 —— 只能说明可能是副本，不构成证据，所以这里只做可逆的那一步。 */
+const QUARANTINE_DIR = "jsbridge-quarantine";
+
+function storageRoot() { return PathUtils.join(Zotero.DataDirectory.dir, "storage"); }
+function quarantineRoot() { return PathUtils.join(Zotero.DataDirectory.dir, QUARANTINE_DIR); }
+
+function quarantineStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-` +
+    `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function currentOrphans() {
+  const live = new Set(await Zotero.DB.columnQueryAsync(
+    "SELECT key FROM items WHERE itemID IN (SELECT itemID FROM itemAttachments)") || []);
+  let kids = [];
+  try { kids = await IOUtils.getChildren(storageRoot()); }
+  catch (e) { return { error: String(e.message || e) }; }
+  const dirs = kids.map(f => PathUtils.filename(f)).filter(n => n && n.length === 8);
+  return { orphans: dirs.filter(n => !live.has(n)) };
+}
+
+/* 真写要过两道闸：`dryRun` 显式关掉（和 apply 一致），再加 `confirm`。
+ * 拆成两个独立判断，是因为「没说要写」和「说要写但没确认」要回不同的东西 ——
+ * 前者是正常预演，后者是拒绝。 */
+const wantsWrite = (p) => p.dryRun !== undefined && !asBool(p.dryRun);
+const CONFIRM_MSG = "真写要同时传 dryRun:false 和 confirm:true。" +
+  "这个端点动文件系统，VACUUM 备份覆盖不到它，所以比 apply 多一道闸。";
+
+async function storageList() {
+  const root = quarantineRoot();
+  const stamps = [];
+  try {
+    const kids = await IOUtils.getChildren(root);
+    for (const d of kids) {
+      let st; try { st = await IOUtils.stat(d); } catch (e) { continue; }
+      if (st.type !== "directory") continue;
+      const rec = { stamp: PathUtils.filename(d) };
+      try {
+        const mf = await IOUtils.readJSON(PathUtils.join(d, "manifest.json"));
+        rec.dirs = (mf.dirs || []).length;
+        rec.bytes = mf.bytes || 0;
+        rec.mb = mb(mf.bytes || 0);
+        rec.at = mf.at;
+      } catch (e) { rec.manifest = "读不到"; }
+      stamps.push(rec);
+    }
+  } catch (e) { /* 还没建过隔离目录，正常 */ }
+  return { ok: true, op: "list", root, count: stamps.length, stamps,
+    note: "每次隔离一个时间戳子目录，里面的 manifest.json 记着每个目录的原位置和体积，" +
+      "restore 就是照着它搬回来。" };
+}
+
+async function storageQuarantine(p) {
+  const found = await currentOrphans();
+  if (found.error) return { error: found.error };
+  const src = storageRoot();
+  const entries = [];
+  let bytes = 0, files = 0;
+  for (const n of found.orphans) {
+    let b = 0, f = 0;
+    for (const x of await walkFiles(PathUtils.join(src, n))) { b += x.size; f++; }
+    bytes += b; files += f;
+    entries.push({ dir: n, bytes: b, files: f });
+  }
+  const base = { op: "quarantine", dirs: entries.length, files, bytes, mb: mb(bytes) };
+
+  if (!wantsWrite(p)) {
+    return Object.assign(base, { ok: true, dryRun: true, sample: entries.slice(0, 20) });
+  }
+  if (!asBool(p.confirm)) return Object.assign(base, { ok: false, dryRun: true, error: CONFIRM_MSG });
+
+  const stamp = quarantineStamp();
+  const dest = PathUtils.join(quarantineRoot(), stamp);
+  await IOUtils.makeDirectory(dest);
+  const moved = [], failed = [];
+  for (const e of entries) {
+    try { await IOUtils.move(PathUtils.join(src, e.dir), PathUtils.join(dest, e.dir)); moved.push(e.dir); }
+    catch (err) { failed.push({ dir: e.dir, why: String(err.message || err) }); }
+  }
+  const kept = entries.filter(e => moved.indexOf(e.dir) >= 0);
+  /* manifest 在**搬完之后**写，只记真正搬成功了的那批 —— 记多了 restore 会去搬不存在的目录，
+   * 记少了那批就再也找不回来。**体积和文件数也要按 kept 重算**，不能直接抄上面的总计：
+   * 搬失败几个的话，manifest 里的字节数会比实际躺在隔离区里的多，
+   * 而 restore 报的就是这个数 —— 一个偏大的"还原了 N MB"没有任何用处。 */
+  const keptBytes = kept.reduce((a, e) => a + e.bytes, 0);
+  const keptFiles = kept.reduce((a, e) => a + e.files, 0);
+  await IOUtils.writeJSON(PathUtils.join(dest, "manifest.json"),
+    { stamp, at: new Date().toISOString(), from: src, dirs: kept, bytes: keptBytes, files: keptFiles });
+  return Object.assign(base, {
+    ok: true, dryRun: false, stamp, quarantined: moved.length,
+    failed: failed.length, failedSample: failed.slice(0, 10), root: dest,
+    undo: `POST /zoterojs/storage {"op":"restore","stamp":"${stamp}","dryRun":false,"confirm":true}`,
+  });
+}
+
+async function storageRestore(p) {
+  const stamp = String(p.stamp || "").trim();
+  if (!stamp) return { error: "要传 stamp。先 op:list 看有哪些。" };
+  const src = PathUtils.join(quarantineRoot(), stamp);
+  let mf;
+  try { mf = await IOUtils.readJSON(PathUtils.join(src, "manifest.json")); }
+  catch (e) { return { error: `读不到 ${stamp} 的 manifest.json：${String(e.message || e)}` }; }
+  const base = { op: "restore", stamp, dirs: (mf.dirs || []).length, bytes: mf.bytes || 0 };
+
+  if (!wantsWrite(p)) return Object.assign(base, { ok: true, dryRun: true });
+  if (!asBool(p.confirm)) return Object.assign(base, { ok: false, dryRun: true, error: CONFIRM_MSG });
+
+  const dest = storageRoot();
+  const moved = [], failed = [];
+  for (const e of mf.dirs || []) {
+    try { await IOUtils.move(PathUtils.join(src, e.dir), PathUtils.join(dest, e.dir)); moved.push(e.dir); }
+    catch (err) {
+      // 目标已存在就别硬搬 —— 上一轮搬回去了、或者那 8 位 key 被 Zotero 重新分配了
+      failed.push({ dir: e.dir, why: String(err.message || err) });
+    }
+  }
+  const partial = moved.length < (mf.dirs || []).length;
+  // manifest 只在**全部搬回去之后**才删：还剩几个没搬，留着才能再来一次。
+  if (!failed.length) {
+    try { await IOUtils.remove(PathUtils.join(src, "manifest.json")); } catch (e) {}
+  }
+  return Object.assign(base, {
+    ok: true, dryRun: false, restored: moved.length, failed: failed.length,
+    failedSample: failed.slice(0, 10),
+    partial: partial ? "有一部分没搬回去，manifest 留着，可以再来一次" : undefined,
+  });
+}
+
+/* 按文件名把断掉的外链附件重新指回去。匹配用 basename **全等**，不做模糊匹配 ——
+ * 模糊匹配会"修"出一个错的路径，那比不修更糟：条目看着好了，点开是另一篇。
+ * 只在调用方点名的目录里找，不扫全盘。
+ *
+ * 这里**不覆盖 storage 那一路**：外链附件本来就不该有 storage 目录（见 doctor 的 linkedFiles），
+ * 所以这一项和隔离/还原是两回事，只是都落在"文件到底在哪"这个问题上。 */
+async function storageRelocate(p) {
+  const where = String(p.dir || "").trim();
+  if (!where) return { error: "要传 dir（去哪里找那些文件）" };
+
+  const ids = await Zotero.DB.columnQueryAsync(
+    "SELECT i.itemID FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID WHERE ia.linkMode = ?",
+    [LINK_MODE_LINKED_FILE]);
+  const items = await Zotero.Items.getAsync((ids || []).map(Number));
+  const broken = [];
+  for (const it of items || []) {
+    if (!it) continue;
+    let f = null;
+    try { f = await it.getFilePathAsync(); } catch (e) { f = null; }
+    if (!f) broken.push(it);
+  }
+
+  let scanned = 0;
+  let onDisk = [];
+  try { onDisk = await walkFiles(where, true); }
+  catch (e) { return { error: `读不了 ${where}：${String(e.message || e)}` }; }
+  const byName = new Map();
+  for (const x of onDisk) {
+    const k = x.name.toLowerCase();
+    if (!byName.has(k)) byName.set(k, x.path);
+    scanned++;
+  }
+  const plan = [];
+  for (const it of broken) {
+    const want = PathUtils.filename(String(it.attachmentPath || ""));
+    const hit = want ? byName.get(want.toLowerCase()) : null;
+    plan.push({ key: it.key, want, found: hit || null });
+  }
+  const matched = plan.filter(x => x.found);
+  const base = { op: "relocate", searched: where, scanned, broken: broken.length, matched: matched.length, plan };
+
+  if (!wantsWrite(p)) return Object.assign(base, { ok: true, dryRun: true });
+  if (!asBool(p.confirm)) return Object.assign(base, { ok: false, dryRun: true, error: CONFIRM_MSG });
+
+  const libID = Zotero.Libraries.userLibraryID;
+  const done = [], failed = [];
+  for (const x of matched) {
+    const it = Zotero.Items.getByLibraryAndKey(libID, x.key);
+    if (!it) { failed.push({ key: x.key, why: "条目不见了" }); continue; }
+    try { it.attachmentPath = x.found; await it.saveTx(); done.push({ key: x.key, to: x.found }); }
+    catch (e) { failed.push({ key: x.key, why: String(e.message || e) }); }
+  }
+  return Object.assign(base, {
+    ok: true, dryRun: false, relocated: done.length, done,
+    failed: failed.length, failedSample: failed.slice(0, 10),
+  });
+}
+
+async function doStorage(p) {
+  const op = String(p.op || "list").toLowerCase();
+  if (op === "list") return await storageList();
+  if (op === "quarantine") return await storageQuarantine(p);
+  if (op === "restore") return await storageRestore(p);
+  if (op === "relocate") return await storageRelocate(p);
+  return { error: `未知 op ${op}；可用 list / quarantine / restore / relocate` };
 }
 
 /* ---------------- 批量写：apply ---------------- */
@@ -1200,9 +1589,65 @@ async function applyOne(item, op, dryRun) {
   return changes;
 }
 
+/* ---------------- 标签归并（库级，不是条目级） ---------------- */
+
+/* 标签是**库级**的：归并两个标签动的是全库里所有带着它的条目，塞不进 applyOne 那套
+ * 「一个 op 对一个条目」的形状。这里只沿用 doApply 的**纪律**（备份、dry-run 默认开、
+ * 逐条报告），不走它的条目差分 —— 那套差分盯的是集合归属，标签归并不碰集合。
+ *
+ * 下面这条是真副作用，写在这里是因为它必须被报出来而不是默默发生：
+ * Zotero.Tags.rename 的 SQL 是
+ *   UPDATE OR REPLACE itemTags SET tagID = ?, **type = 0** WHERE tagID = ? AND itemID IN (…)
+ * 那个 type=0 会把**自动标签转成手动标签**。实测这个库 48 组大小写重复**全部**是自动标签
+ * （196 条自动关联 vs 2 条手动），所以归并等于把这 196 条转成手动。未必是坏事 ——
+ * 用户主动归并过之后本来就不该再被自动管理 —— 但调用方得知道。
+ *
+ * 目标名已经存在时**不是错误**：rename 内部 `create(newName)` 把两边并成一条，
+ * 结尾的 `purge(oldTagID)` 清掉旧行，颜色也一并转移。所以这里不必自己做合并检测，
+ * 只把 mergesIntoExisting 报出来给人看。 */
+async function renameTag(libID, from, to, dryRun) {
+  const f = String(from == null ? "" : from).trim();
+  const t = String(to == null ? "" : to).trim();
+  if (!f || !t) throw new Error("from / to 都要给");
+  if (f === t) return { from: f, to: t, status: "no-change", why: "两个名字一样" };
+  const id = Zotero.Tags.getID(f);
+  if (!id) throw new Error(`标签「${f}」不存在`);
+  const rows = await Zotero.DB.queryAsync(
+    "SELECT type AS t, count(*) AS n FROM itemTags WHERE tagID = ? GROUP BY type", [id]);
+  let manual = 0, auto = 0;
+  for (const r of rows || []) {
+    if (Number(r.t) === 0) manual += Number(r.n); else auto += Number(r.n);
+  }
+  const rec = { from: f, to: t, items: manual + auto, autoBecomeManual: auto };
+  const tid = Zotero.Tags.getID(t);
+  if (tid) {
+    const n = await Zotero.DB.queryAsync("SELECT count(*) AS n FROM itemTags WHERE tagID = ?", [tid]);
+    rec.mergesIntoExisting = (n && n[0] && Number(n[0].n)) || 0;
+  }
+  if (dryRun) return Object.assign(rec, { status: "would-merge" });
+  await Zotero.Tags.rename(libID, f, t);
+  return Object.assign(rec, { status: "merged" });
+}
+
+async function applyTags(list, dryRun, libID) {
+  const report = [];
+  for (const raw of list) {
+    const rec = { from: raw && raw.from, to: raw && raw.to };
+    try {
+      report.push(Object.assign(rec, await renameTag(libID, rec.from, rec.to, dryRun)));
+    } catch (e) {
+      report.push(Object.assign(rec, { status: "error", why: String(e.message || e) }));
+    }
+  }
+  return report;
+}
+
 async function doApply(p) {
   const ops = Array.isArray(p.ops) ? p.ops : [];
-  if (!ops.length) return { error: "需要 {ops: [{item: 'KEY', set: {...}}, ...]}" };
+  const tags = Array.isArray(p.tags) ? p.tags : [];
+  if (!ops.length && !tags.length) {
+    return { error: "需要 {ops: [{item: 'KEY', set: {...}}, ...]} 或 {tags: [{from, to}, ...]}" };
+  }
   const dryRun = !!p.dryRun;
   const libID = Zotero.Libraries.userLibraryID;
   const stoppedOnError = p.stopOnError === undefined ? true : asBool(p.stopOnError);
@@ -1210,7 +1655,9 @@ async function doApply(p) {
   let backup = null;
   // tag 只影响备份文件名。enrich 复用这段写逻辑时传 "enrich"，
   // 事后翻备份目录能一眼看出这次写是哪个端点干的。
-  if (!dryRun) backup = await backupBefore(p.tag || "apply");
+  if (!dryRun) backup = await backupBefore(p.tag || (tags.length ? "tags" : "apply"));
+
+  const tagReport = tags.length ? await applyTags(tags, dryRun, libID) : null;
 
   const report = [];
   for (const op of ops) {
@@ -1304,8 +1751,17 @@ async function doApply(p) {
     errors: report.filter(r => r.status === "error").length,
     report,
   };
+  if (tagReport) {
+    out.tags = tagReport;
+    out.tagsMerged = tagReport.filter(r => r.status === "merged").length;
+    out.tagsErrors = tagReport.filter(r => r.status === "error").length;
+  }
   if (backup) out.backup = backup;
   const warns = [];
+  if (tagReport && tagReport.some(r => r.autoBecomeManual)) {
+    warns.push("标签归并会把**自动标签转成手动标签**（Zotero.Tags.rename 的 SQL 里写死 type=0），" +
+      "见各条的 autoBecomeManual —— 转手动之后 Zotero 不会再自动管理它们。");
+  }
   if (report.some(r => r.collectionsLost)) {
     warns.push("有条目丢了集合归属，见各条的 collectionsLost —— **这不是报错，是 Zotero 的正常行为**，" +
       "但它静默发生，所以必须补回去。");
@@ -1973,6 +2429,24 @@ const EP_ENRICH = Ctor({
   },
 });
 
+/* 按**写**过闸，连 GET 也算：默认那个 list 动作是只读的，但同一个入口能 move 文件，
+ * 而只读模式 / 关掉这个端点的人本来就不该让这个入口通着（和 enrich 同一个理由）。 */
+const EP_STORAGE = Ctor({
+  supportedMethods: ["GET", "POST"],
+  supportedDataTypes: ["application/json"],
+  init: async function (options) {
+    const bad = checkAuth(options) || gate("/zoterojs/storage", true);
+    if (bad) return bad;
+    try {
+      const out = await doStorage(readParams(options));
+      if (out.error) return jsonReply(400, { ok: false, error: out.error });
+      return pack(out);
+    } catch (e) {
+      return jsonReply(500, { ok: false, error: String(e.message || e), stack: String(e.stack || "") });
+    }
+  },
+});
+
 const EP_LOGS = Ctor({
   supportedMethods: ["GET", "POST"],
   supportedDataTypes: ["application/json"],
@@ -2044,6 +2518,7 @@ async function startup({ id, version, resourceURI, rootURI }, reason) {
     "/zoterojs/doctor": EP_DOCTOR,
     "/zoterojs/apply": EP_APPLY,
     "/zoterojs/enrich": EP_ENRICH,
+    "/zoterojs/storage": EP_STORAGE,
   };
   for (const path of Object.keys(epTable)) {
     const existing = Zotero.Server.Endpoints[path];

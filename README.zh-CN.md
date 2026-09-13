@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-在**正在运行的 Zotero 进程内**执行 JavaScript 的插件：把八个本地 HTTP 端点挂在 Zotero 自带的服务器上，让脚本代劳合并条目、查询库、批量改元数据、备份，而不必每次打开 **工具 → 开发者 → Run JavaScript** 手贴代码。
+在**正在运行的 Zotero 进程内**执行 JavaScript 的插件：把九个本地 HTTP 端点挂在 Zotero 自带的服务器上，让脚本代劳合并条目、查询库、批量改元数据、备份、清理孤儿附件目录，而不必每次打开 **工具 → 开发者 → Run JavaScript** 手贴代码。
 
 [![release](https://img.shields.io/github/v/release/Sum-su/zotero-js-bridge?label=release)](../../releases/latest)
 [![CI](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml/badge.svg)](../../actions/workflows/test.yml)
@@ -11,7 +11,7 @@
 
 ## 为什么需要它
 
-Zotero 的插件 API **没有进程外通道**。凡是连接器 API 覆盖不到的——合并重复条目、搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。本插件挂在 Zotero 本来就在跑的 `127.0.0.1:23119` 服务器上，在那里注册八个 JSON 端点。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
+Zotero 的插件 API **没有进程外通道**。凡是连接器 API 覆盖不到的——合并重复条目、搬移附件、批量改字段、调用内部模块——只能从 Zotero 进程内做。本插件挂在 Zotero 本来就在跑的 `127.0.0.1:23119` 服务器上，在那里注册九个 JSON 端点。**不另开端口、不持有 socket**，所以不影响 Zotero 退出。
 
 > [!WARNING]
 > 这些端点能在 Zotero 里执行**任意 JavaScript**，可读写你整个库。任何能读到 token 文件的进程都能删掉你的库。这是个人自动化工具，不是加固过的服务——装之前请先读[安全模型](#安全模型)。
@@ -21,7 +21,7 @@ Zotero 的插件 API **没有进程外通道**。凡是连接器 API 覆盖不�
 | | |
 | --- | --- |
 | Zotero | 7 到 10（`strict_min_version` `6.999`，`strict_max_version` `10.99.99`）；开发与验证均在 **Zotero 10.0.2** 上完成 |
-| Python | 3.8+（只为自带的客户端；协议本身是八个 JSON 端点，任何 HTTP 客户端都能用） |
+| Python | 3.8+（只为自带的客户端；协议本身是九个 JSON 端点，任何 HTTP 客户端都能用） |
 
 ## 安装
 
@@ -82,6 +82,7 @@ zjs.backup()
 | `/zoterojs/doctor` | GET、POST | | 只读库体检；**默认不联网**。 |
 | `/zoterojs/apply` | POST | ✅ | 批量改元数据，默认演练，自动报集合归属差分。 |
 | `/zoterojs/enrich` | GET、POST | ✅ | 把视觉模型从扫描件上读到的补进空字段。**只填空，永不覆盖。** |
+| `/zoterojs/storage` | GET、POST | ✅ | 隔离孤儿 `storage/` 目录、把断掉的外链附件重新指回去。**唯一动文件系统的端点**，所以真写要同时传 `dryRun:false` 和 `confirm:true`。 |
 
 `backup` **不是端点**——它是面板上的按钮，外加一个「写操作前自动备份」的开关。
 
@@ -100,7 +101,7 @@ zjs.backup()
 
 | Pref（`extensions.zotero.jsbridge.…`） | 默认 | 作用 |
 | --- | --- | --- |
-| `enabled` | `true` | 设 `false` → 八个端点全返 `503` |
+| `enabled` | `true` | 设 `false` → 九个端点全返 `503` |
 | `readonly` | `false` | 设 `true` → `exec` / `merge` / `apply` / `enrich` 返 `403`，读的口子照开 |
 | `endpoint.ping` … `endpoint.enrich` | `true` | 设 `false` → 该路径返 `404` |
 | `enrich.minChars` | `1000` | 抽出的字符数低于此值，就认为这个 PDF 没有文本层 |
@@ -110,7 +111,7 @@ zjs.backup()
 
 `ping` 会报出开关的实时状态，调用方**可以问，不用猜**：`disabled` 列出当前被关掉的路径，`readonly` 是只读开关的当前值。
 
-面板里还有 token 操作（复制 / 重新生成 / 重写文件）、**立即备份**按钮，以及一个**自检**按钮——报告八个端点是否注册、开关当前是什么、token 文件在不在。自检**故意不联网**：它不会向 `127.0.0.1:23119` 发请求，因为 Zotero 自己的 CSRF 守卫会把它拦掉，那样一旦失败也说明不了任何问题。
+面板里还有 token 操作（复制 / 重新生成 / 重写文件）、**立即备份**按钮，以及一个**自检**按钮——报告九个端点是否注册、开关当前是什么、token 文件在不在。自检**故意不联网**：它不会向 `127.0.0.1:23119` 发请求，因为 Zotero 自己的 CSRF 守卫会把它拦掉，那样一旦失败也说明不了任何问题。
 
 ## 安全模型
 
@@ -121,7 +122,7 @@ zjs.backup()
 - **`exec` 故意不设限。** 它就是 `new AsyncFunction(...)` 套你的代码。这正是它的用途——它不是沙箱，也不假装是。
 - **无 TLS。** 流量是 loopback 明文。
 
-现有的缓解：除 `ping` 外都要 token；对存储的 token 做**常数时间比较**；可配置的响应上限；总开关 + 八个端点开关 + 只读模式；`shutdown()` 时清理端点；三个写端点默认演练；写入前自动备份，且**备份失败就中止这次写**。
+现有的缓解：除 `ping` 外都要 token；对存储的 token 做**常数时间比较**；可配置的响应上限；总开关 + 九个端点开关 + 只读模式；`shutdown()` 时清理端点；`apply` / `enrich` 默认演练、`storage` 连真写都要两道闸；写入前自动备份，且**备份失败就中止这次写**。
 
 **这些开关是「限制爆炸半径」，不是「安全边界」。** 它们管的是*你自己*跑的脚本能捅多大娄子——把终端交给一个没那么小心的东西时有用。它们挡不住已经拿到 token 的人：那个人可以把 pref 改回去。
 
@@ -160,7 +161,7 @@ python check_backup.py [DIR]     # 只读打开每份备份，验完整性
 
 | 文件 | 内容 |
 | --- | --- |
-| [`docs/endpoints.md`](docs/endpoints.md) | 八个端点的完整参考：参数、响应、错误码 |
+| [`docs/endpoints.md`](docs/endpoints.md) | 九个端点的完整参考：参数、响应、错误码 |
 | [`docs/merge.md`](docs/merge.md) | 合并自检、归一化、ISBN 硬防线 |
 | [`docs/enrich.md`](docs/enrich.md) | 扫描件补全：两种模式、三道闸、实测数据 |
 | [`docs/zotero-internals.md`](docs/zotero-internals.md) | Zotero / Firefox 平台陷阱，全部实测而非推测 |

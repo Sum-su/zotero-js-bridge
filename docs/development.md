@@ -103,7 +103,7 @@ The test job runs the suite and the mutation pass, because the suite alone is no
 
 ## Versioning
 
-Bump the version on every build: Zotero ignores a reinstall whose version is unchanged. `build.py --bump` accepts only a two-segment version, matching `"(\d+)\.(\d+)"` in `manifest.json` (currently `1.12`). The change from `1.0.11` to `1.12` was a convention change to two-part decimal and was made by hand in `manifest.json`; a three-segment version is rejected rather than bumped, because bumping `1.0.11` to `1.0.12` would break the convention while looking entirely normal. Under the new scheme the second segment is a counter: `1.12 → 1.13 → … → 1.19 → 1.20`, with the carry written `1.20` rather than `1.2`, so the value increases both as a decimal and segment-wise.
+Bump the version on every build: Zotero ignores a reinstall whose version is unchanged. `build.py --bump` accepts only a two-segment version, matching `"(\d+)\.(\d+)"` in `manifest.json` (currently `1.13`). The change from `1.0.11` to `1.12` was a convention change to two-part decimal and was made by hand in `manifest.json`; a three-segment version is rejected rather than bumped, because bumping `1.0.11` to `1.0.12` would break the convention while looking entirely normal. Under the new scheme the second segment is a counter: `1.12 → 1.13 → … → 1.19 → 1.20`, with the carry written `1.20` rather than `1.2`, so the value increases both as a decimal and segment-wise.
 
 ## The `updates.json` hazard
 

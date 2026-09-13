@@ -1,12 +1,12 @@
 # Zotero JS Bridge endpoint reference
 
-This file is the complete reference for the eight HTTP endpoints that the Zotero JS Bridge plugin (v1.12) registers on Zotero's own local server, with each endpoint's purpose, parameters, response shape, and error codes.
+This file is the complete reference for the nine HTTP endpoints that the Zotero JS Bridge plugin registers on Zotero's own local server, with each endpoint's purpose, parameters, response shape, and error codes.
 
 ## The endpoint layer
 
-Zotero already runs an HTTP server on `127.0.0.1:23119` for its connector API. The plugin registers eight paths on that server, so a local script can execute JavaScript inside a running Zotero, merge duplicates, read the error console, query the library, and run health checks. All eight ride on Zotero's own server: nothing new is bound, and no socket is held open, so Zotero still exits cleanly.
+Zotero already runs an HTTP server on `127.0.0.1:23119` for its connector API. The plugin registers nine paths on that server, so a local script can execute JavaScript inside a running Zotero, merge duplicates, read the error console, query the library, run health checks, and quarantine orphaned attachment directories. All nine ride on Zotero's own server: nothing new is bound, and no socket is held open, so Zotero still exits cleanly.
 
-Four endpoints can write (`exec`, `merge`, `apply`, `enrich`); the other four are read-only (`ping`, `logs`, `query`, `doctor`). Read-only mode closes the write paths and leaves the read ones open.
+Five endpoints can write (`exec`, `merge`, `apply`, `enrich`, `storage`); the other four are read-only (`ping`, `logs`, `query`, `doctor`). Read-only mode closes the write paths and leaves the read ones open.
 
 Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin` header, are dropped by Zotero's own CSRF guard before they reach the plugin. Command-line clients are unaffected; browser-side callers need `x-zotero-connector-api-version`, as with any Zotero plugin endpoint.
 
@@ -22,6 +22,7 @@ Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin` he
 | GET, POST | `/zoterojs/doctor` | `X-ZoteroJS-Token` | no |
 | POST | `/zoterojs/apply` | `X-ZoteroJS-Token` | yes, including a dry run |
 | GET, POST | `/zoterojs/enrich` | `X-ZoteroJS-Token` | yes, on both verbs |
+| GET, POST | `/zoterojs/storage` | `X-ZoteroJS-Token` | yes, on both verbs |
 
 ## Authentication, gates, and error codes
 
@@ -35,7 +36,7 @@ Authentication is checked before the gate, so a request with a missing or incorr
 | `404` | that endpoint's own pref `extensions.zotero.jsbridge.endpoint.<name>` is `false` | `error`, `pref` |
 | `403` | the bridge is in read-only mode (`extensions.zotero.jsbridge.readonly`) and the call counts as a write | `error`, `pref` |
 
-The write-gated endpoints are `exec`, `merge`, `apply`, and `enrich`. `apply` and `enrich` are refused even for a dry run: read-only mode means the endpoint is not available, not that a rehearsal is allowed. `enrich` is gated as a write on both verbs, because its scan form extracts the full text of hundreds of PDFs and takes minutes. `logs` is gated as a read, and only its `clear` parameter is refused in read-only mode.
+The write-gated endpoints are `exec`, `merge`, `apply`, `enrich`, and `storage`. `apply`, `enrich`, and `storage` are refused even for a dry run: read-only mode means the endpoint is not available, not that a rehearsal is allowed. `enrich` and `storage` are gated as a write on both verbs — `enrich` because its scan form extracts the full text of hundreds of PDFs and takes minutes, `storage` because the same entry can move files even though its default `list` op only reads. `logs` is gated as a read, and only its `clear` parameter is refused in read-only mode.
 
 A missing or invalid token produces `403` with `{"ok": false, "error": "missing or invalid X-ZoteroJS-Token"}`. Bad parameters produce `400`; an unexpected internal failure produces `500` with `error` and `stack`.
 
@@ -57,10 +58,10 @@ Response fields:
 | --- | --- | --- |
 | `ok` | boolean | `true` on success |
 | `name` | string | `"Zotero JS Bridge"` |
-| `version` | string | plugin version — `"1.12"` in this release |
+| `version` | string | plugin version — `"1.13"` in this release |
 | `zotero` | string | `Zotero.version` |
 | `libraryID` | number | user library ID |
-| `endpoints` | array | all eight paths |
+| `endpoints` | array | all nine paths |
 | `disabled` | array | the subset of paths currently switched off |
 | `readonly` | boolean | live value of the read-only switch |
 
@@ -68,7 +69,7 @@ Response fields:
 
 ```console
 $ python zoterojs.py ping
-{ "ok": true, "name": "Zotero JS Bridge", "version": "1.12", "zotero": "10.0.2",
+{ "ok": true, "name": "Zotero JS Bridge", "version": "1.13", "zotero": "10.0.2",
   "libraryID": 1, "endpoints": ["/zoterojs/ping", ...], "disabled": [], "readonly": false }
 ```
 
@@ -361,22 +362,25 @@ Bundled client: `zjs.query(title=None, doi=None, isbn=None, creator=None, collec
 
 ## The `doctor` endpoint
 
-Read-only library health check. Seven checks are available. By default all of them run except `sync`; `sync` contacts zotero.org, so it must be requested explicitly. The endpoint does not touch the network unless `sync` is named.
+Read-only library health check. Nine checks are available. By default all of them run except `sync`; `sync` contacts zotero.org, so it must be requested explicitly. The endpoint does not touch the network unless `sync` is named.
 
 Methods: `GET` or `POST` (JSON body).
 
 | Parameter | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `checks` | string or array | all except `sync` | check names to run |
-| `all` | boolean | `false` | run all seven checks, `sync` included |
+| `all` | boolean | `false` | run all nine checks, `sync` included |
 | `days` | number | `30`, clamped to 1–3650 | window used by `trashWriteback` |
 | `titles` | string or array | `Full Text PDF` | importer-default titles counted by `attachmentTitle` |
+| `deep` | boolean | `false` | `orphanStorage` only: additionally compare each orphan content file's byte size against the live library (slow, so it is off by default) |
 
 The checks:
 
 | Check | Reports |
 | --- | --- |
-| `orphanStorage` | directories under `<data-dir>/storage` with no matching attachment row (`count`, `scanned`, and a sample of up to 20) |
+| `orphanStorage` | directories under `<data-dir>/storage` with no matching attachment row; sizes split into content vs regenerable cache, per-extension totals, and a sample of up to 20 directory names; `deep` adds a byte-size comparison against the live library |
+| `linkedFiles` | linked-file (`linkMode` 2) and linked-URL (`linkMode` 3) attachments, split into broken / resolving / URL groups; URL reachability is not tested — that needs the network |
+| `tagVariants` | tags that differ only in case or punctuation, grouped after normalization, with the manual/auto row counts a merge would touch |
 | `unfiled` | items in no collection, using Zotero's own `unfiled` search condition rather than hand-written SQL (`count` plus a sample of up to 20) |
 | `attachmentTitle` | attachment titles still at an importer default, empty titles, and titles that match neither the full filename nor its extensionless form (`count`, `emptyCount`, `mismatchCount`, with samples) |
 | `duplicateFilenames` | two identically named attachments under the same parent item (`count` plus a sample) |
@@ -396,6 +400,51 @@ Response fields:
 
 A check that throws is reported as an error string inside its own `checks` entry; the other checks still run.
 
+### The `orphanStorage`, `linkedFiles`, and `tagVariants` results
+
+`orphanStorage` splits the orphan size into content and cache because the two have different standing: `.zotero-ft-cache` and `.zotero-reader-state` files are regenerable by Zotero, while everything else is not. Zotero 10 has no `Zotero.FileIntegrity`; `Zotero.Schema.integrityCheck` checks the database schema and never touches the filesystem; `Zotero.FullText.purgeOrphanedContent` covers the cache files only. Nothing built-in cleans the rest, which is what the `storage` endpoint is for.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `count` | number | orphan directories: `storage/` entries whose 8-character name matches no attachment row |
+| `scanned` | number | 8-character directories examined under `storage/` |
+| `files`, `bytes`, `mb` | number | totals over the orphan trees, cache files included |
+| `cacheFiles`, `cacheBytes`, `cacheMB` | number | regenerable `.zotero-ft-cache` / `.zotero-reader-state` files |
+| `contentFiles`, `contentBytes`, `contentMB` | number | the rest — the part that cannot be regenerated |
+| `byExt` | object | per-extension `{files, bytes}` totals over content files only; files without an extension are keyed `(无扩展名)` |
+| `sample` | array | up to 20 orphan directory names |
+| `note` | string | why the count only grows, and what the built-ins do and do not cover |
+| `deep` | object | present only with `deep`: `duplicateBySize` / `duplicateMB` and `unmatchedBySize` / `unmatchedMB` — orphan content files with / without a same-size file in the live library — plus a `note` that same size is a lead, not proof |
+
+`count` only grows under normal use, because directories left behind by history stay; the number to compare is the one before and after an operation, not its absolute value.
+
+`linkedFiles` covers the two attachment modes that never have a storage directory — linked files (`linkMode` 2) and linked URLs (`linkMode` 3). Their absence from `storage/` is expected, so they must not be counted as orphans; explaining that is the check's main job.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `total` | number | attachments with `linkMode` 2 or 3 |
+| `brokenCount`, `broken` | number, array | linked files whose path does not resolve; up to 20 rows of `{key, path, title?}`, where `title` is the parent item's title |
+| `okCount`, `ok` | number, array | linked files that resolve; up to 10 rows |
+| `urlCount`, `urls` | number, array | linked URLs; up to 10 rows. Reachability is not tested — that needs the network, and `doctor` does not go online unless `sync` is named |
+| `note` | string | why these are not orphans, and that the fix for a broken one is `relocate` on the `storage` endpoint |
+
+`tagVariants` groups tags that are equal after normalization. The normalization is computed, never read: the check lowercases and strips whitespace and punctuation with the project's `strip()` ([merge.md](merge.md#normalization-before-comparison)), because `tags.nameNormalized` was NULL in 3440 of the 3467 tag rows on the real library.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `groups` | number | groups holding two or more tags that are equal after normalization |
+| `variants` | number | tags across those groups |
+| `autoTagRows`, `manualTagRows` | number | item-tag rows across the groups, split by association type (`itemTags.type` 1 = automatic, 0 = manual) |
+| `sample` | array | up to 10 groups; each group is an array of `{name, items, manual, auto}` rows |
+| `note` | string | the fix, and the side effect below |
+
+The fix is a library-level tag merge on the `apply` endpoint (`{"tags": [{"from": ..., "to": ...}]}`), dry-run by default. Two facts about that merge are reported rather than left to be discovered:
+
+- `Zotero.Tags.rename`'s SQL is `UPDATE OR REPLACE itemTags SET tagID = ?, type = 0 WHERE tagID = ? AND itemID IN (...)`. The hard-coded `type = 0` means a merge **converts automatic tags to manual tags**; `autoTagRows` is how many rows change hands. Measured on the real library, all 48 case-duplicate groups were automatic (196 automatic rows against 2 manual), so a merge hands those associations to the user to keep.
+- `itemTags` has `PRIMARY KEY (itemID, tagID)` and the statement is `UPDATE OR REPLACE`, so an item that holds both spellings ends up with **one** row, not two.
+
+`tags` is a global table with no `libraryID` column, so this check cannot be scoped to the user library the way the item checks are; it joins `tags` and `itemTags` with no library filter.
+
 Error codes:
 
 | Code | Condition |
@@ -406,7 +455,7 @@ Error codes:
 | `500` | an unexpected exception |
 | `503` | master switch off |
 
-Bundled client: `zjs.doctor(checks=None, all_checks=False, days=30, timeout=300)`; CLI `python zoterojs.py doctor [CHECK ...] [--all] [--days N]`.
+Bundled client: `zjs.doctor(checks=None, all_checks=False, days=30, timeout=300)`; CLI `python zoterojs.py doctor [CHECK ...] [--all] [--days N]`. The client passes check names through, so the new names work from both; `deep` has no client switch yet — send it in the HTTP request directly.
 
 ## The `apply` endpoint
 
@@ -556,9 +605,75 @@ python zoterojs.py enrich findings.json [--yes]  # write back what vision read
 
 Bundled client: `zjs.enrich(findings=None, items=None, scan=False, dry_run=True, strict=True, stop_on_error=True, missing_only=None, min_chars=None, include_indexed=False, limit=None, offset=None, timeout=300)`. The CLI writes back only with `--yes`; `--loose` turns the gates off for a negative test. The deep dive — the measured case for using extracted character count over `getIndexedState`, the three gates, and the `series` rule — is in [the `enrich` endpoint](enrich.md).
 
+## The `storage` endpoint
+
+Filesystem hygiene for the `storage` directory: quarantine orphan attachment directories, move a quarantined batch back, and re-point broken linked-file attachments at files that still exist on disk. It is the only endpoint that touches the filesystem, so it is also the only one where the automatic database backup is no help — a real write therefore needs **two** gates, `dryRun: false` and `confirm: true`.
+
+Measured on a real library on 2026-09-13: 327 orphan directories holding 447 files and 3.53 GB, and no built-in cleaner for the attachment files among them. The deep dive — why quarantine replaced delete, why the relocation match is exact rather than fuzzy, and how the manifest keeps `restore` honest — is in [the `storage` endpoint](storage.md).
+
+Methods: `GET` or `POST` (JSON body). Parameters work the same over GET or POST; a parameter supplied in both places takes its POST body value. Both verbs are gated as a write: `list` only reads, but the same entry can move files.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `op` | string | `list` | `list`, `quarantine`, `restore`, or `relocate`; an unknown value returns `400` listing them |
+| `dryRun` | boolean | — | omit it (or pass `true`) to rehearse; a real write must pass `false` |
+| `confirm` | boolean | `false` | the second gate: with `dryRun: false`, the write runs only when this is `true`; otherwise the call is refused |
+| `stamp` | string | — | `restore`: which quarantine batch to move back (`list` shows the available stamps) |
+| `dir` | string | — | `relocate`: the directory to search for missing linked files; required, and never widened to the whole disk |
+
+Response fields, by op:
+
+| Field | Op | Type | Meaning |
+| --- | --- | --- | --- |
+| `ok` | all | boolean | `true` on success; `false` on a `400` refusal |
+| `op` | all | string | echo of the op that ran |
+| `dryRun` | `quarantine`, `restore`, `relocate` | boolean | `true` on a rehearsal, `false` on a real write |
+| `error` | a failed call | string | the refusal or failure reason |
+| `count` | `list` | number | quarantine batches present; `0` when the root does not exist |
+| `root` | `list` | string | the quarantine root |
+| `root` | `quarantine` (real) | string | the batch directory that was created |
+| `stamps` | `list` | array | one entry per batch: `{stamp, dirs, bytes, mb, at}`, or `{stamp, manifest: "读不到"}` when its manifest cannot be read |
+| `note` | `list` | string | what the batches are, and how `restore` uses the manifest |
+| `dirs`, `bytes` | `quarantine`, `restore` | number | directories that would move / are in the manifest, and their total size |
+| `files`, `mb` | `quarantine` | number | file count and megabyte total of the same set, cache files included |
+| `sample` | `quarantine` | array | up to 20 rows of `{dir, bytes, files}` |
+| `stamp` | `quarantine` (real), `restore` | string | the batch timestamp (`YYYYMMDD-HHMMSS`) |
+| `quarantined` | `quarantine` (real) | number | directories actually moved |
+| `failed`, `failedSample` | `quarantine`, `restore`, `relocate` (real) | number, array | operations that failed; up to 10 rows, `{dir, why}` for the directory ops and `{key, why}` for `relocate` |
+| `undo` | `quarantine` (real) | string | a ready-to-paste `restore` command for this batch |
+| `restored` | `restore` (real) | number | directories moved back |
+| `partial` | `restore` (real) | string | present when some directories failed to move back; the manifest is kept, so `restore` can be retried |
+| `searched` | `relocate` | string | the directory searched |
+| `scanned` | `relocate` | number | files found under it |
+| `broken` | `relocate` | number | broken linked-file attachments considered |
+| `matched` | `relocate` | number | broken attachments with an exact basename match |
+| `plan` | `relocate` | array | one row per broken attachment: `{key, want, found}`, `found: null` when nothing matched |
+| `relocated` | `relocate` (real) | number | items re-pointed |
+| `done` | `relocate` (real) | array | `{key, to}` per re-pointed item |
+
+A refusal carries only `ok: false` and `error`: a write requested without `confirm` is a `400`, not a dry run, and the server does not attach the dry-run report to it.
+
+```console
+$ TOKEN=$(cat "<data-dir>/zoterojs-token.txt")
+$ curl -s -H "X-ZoteroJS-Token: $TOKEN" "http://127.0.0.1:23119/zoterojs/storage?op=quarantine"
+{"ok": true, "op": "quarantine", "dirs": 327, "files": 447, "dryRun": true, "sample": [ ... ]}
+```
+
+Error codes:
+
+| Code | Condition |
+| --- | --- |
+| `400` | unknown `op`; `restore` without `stamp`, or with a manifest that cannot be read; `relocate` without `dir`, or with a `dir` that cannot be read; `quarantine` whose storage root cannot be read; a real write requested without `confirm` |
+| `403` | missing or invalid token; read-only mode (every op, `list` included) |
+| `404` | `endpoint.storage` off |
+| `500` | an unexpected exception |
+| `503` | master switch off |
+
+Bundled client: `zjs.storage_list()`, `zjs.storage_quarantine(dry_run=True, confirm=False)`, `zjs.storage_restore(stamp, dry_run=True, confirm=False)`, `zjs.storage_relocate(dir, dry_run=True, confirm=False)`; CLI `python zoterojs.py storage list` / `quarantine` / `restore STAMP` / `relocate DIR`, where a real write takes `[--yes --confirm]` — both flags, since `--yes` alone is refused and `--confirm` alone still rehearses. The read-only half of the same ground is the `orphanStorage` and `linkedFiles` doctor checks, which run by default.
+
 ## Backups are not an HTTP endpoint
 
-`backup` is not one of the eight endpoints. There is no `/zoterojs/backup` path. Backups have two entry points:
+`backup` is not one of the nine endpoints. There is no `/zoterojs/backup` path. Backups have two entry points:
 
 - a **Backup now** button in the preferences pane (**Tools → Preferences → JS Bridge**), and
 - the automatic-before-write switch `extensions.zotero.jsbridge.backup.enabled` (default `false`). When it is on, `merge`, `apply`, and `enrich` take a full backup before writing, and a failed backup aborts the write — an opt-in safety net that silently misses is worse than none.
@@ -571,5 +686,6 @@ The bundled client's `python zoterojs.py backup` therefore runs through the `exe
 
 - [The `merge` self-check](merge.md)
 - [The `enrich` endpoint](enrich.md)
+- [The `storage` endpoint](storage.md)
 - [Zotero internals notes](zotero-internals.md)
 - [Project README](../README.md)

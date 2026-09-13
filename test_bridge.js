@@ -61,6 +61,14 @@ class Item {
     this._parentItemID = parentItemID === undefined ? null : parentItemID;
     if (this.itemTypeID === undefined) this.itemTypeID = TYPE_ID[this.itemType] ?? 1;
     if (!this.creators) this.creators = [];
+    /* attPath / linkMode 是夹具的短名字，落到真机那两个后备字段上。
+     * linkMode 缺省给 0（= IMPORTED_FILE）：真库的 itemAttachments.linkMode 列
+     * 对导入的附件就是 0，不会空着。上面 setter 里那条「linkMode 没设就抛」因此
+     * 从夹具走不到 —— 它是照抄真实现的，留着防的是"插件拿到一个没加载完的附件"，
+     * 不是靠夹具覆盖的，别把它的存在当成有测试盯着。 */
+    if (this.attPath !== undefined) { this._attachmentPath = this.attPath; delete this.attPath; }
+    if (this.itemType === "attachment" && this.linkMode === undefined) this.linkMode = 0;
+    if (this.linkMode !== undefined) { this._attachmentLinkMode = this.linkMode; delete this.linkMode; }
   }
   getField(f) { return (this.fields || {})[f] ?? ""; }
   setField(f, v) { (this.fields = this.fields || {})[f] = v; }
@@ -111,8 +119,40 @@ class Item {
      这里为了可读性各排各的）—— 所以判据只能走 itemType 字符串，别拿 ID 比。 */
   isAnnotation() { return this.itemType === "annotation"; }
   /* 真实现会解析链接附件和相对路径，拿不到（文件不在本地）时返回 false。
-     夹具用 filePath 给出结果；不给就返回 false，走"没有本地文件"那条分支。 */
-  getFilePathAsync() { return Promise.resolve(this.filePath || false); }
+     夹具可以显式给 filePath 定死结果（enrich 那批就是）；不给的话，对外链路径去 vfs 里
+     查一下 —— **这一步是 relocate 测试的关键**：修完之后得能再跑一次体检看到它变好了，
+     否则"修好了没有"只能靠断言 attachmentPath 那几个字，等于只验了写、没验修。 */
+  getFilePathAsync() {
+    if (this.filePath !== undefined) return Promise.resolve(this.filePath || false);
+    const p = this._attachmentPath;
+    if (p && !String(p).startsWith("storage:") && vfs.has(p)) return Promise.resolve(p);
+    return Promise.resolve(false);
+  }
+  /* ⚠️ 这两个是**访问器，不是普通字段** —— 2026-09-13 从运行中的 Zotero 读的原码：
+   *   get attachmentPath()  { return this.isAttachment() ? this._attachmentPath : undefined; }
+   *   get attachmentLinkMode() { ... this._attachmentLinkMode ... }
+   * 两个 getter 对**非附件返回 undefined**（不是空串、不是 null）。夹具仍然写 attPath /
+   * linkMode 这两个短名字，构造时翻译成后备字段 —— 这样 fixture 那几行不用改，
+   * 而写路径（storage 端点的 relocate 会 `it.attachmentPath = …`）走的是**真 setter**。 */
+  get attachmentPath() { return this.isAttachment() ? this._attachmentPath : undefined; }
+  /* setter 照抄真实现的四道校验（原码逐字，2026-09-13 读的）。照抄它们的意义不在于
+   * 这些错误消息好看，而在于：不抄的话，**给非附件、给非字符串、linkMode 没设**这三种
+   * 写错法在测试里会静默成功，然后 relocate 报出一个漂亮的 relocated: N。 */
+  set attachmentPath(val) {
+    if (!this.isAttachment()) {
+      throw new Error(".attachmentPath can only be set for attachment items");
+    }
+    if (typeof val != "string") throw new Error(".attachmentPath must be a string");
+    const linkMode = this.attachmentLinkMode;
+    if (linkMode === null) throw new Error("Link mode must be set before setting attachment path");
+    if (linkMode === 3 /* LINK_MODE_LINKED_URL */) {
+      throw new Error("attachmentPath cannot be set for link attachments");
+    }
+    this._attachmentPath = val || "";
+  }
+  get attachmentLinkMode() {
+    return this.isAttachment() ? this._attachmentLinkMode : undefined;
+  }
   /* 真实现（item.js:4975）拿到非数字 ID 会抛 `Invalid collection 'undefined'`，
      这里**照抄那个校验**。抄之前 stub 是来者不拒的，于是"插件传了 undefined"
      在测试里完全看不出来 —— 而这正是真机上 addToCollection 从来没成功过的原因。 */
@@ -243,6 +283,25 @@ const ITEMS = {
   ATT_DUP_B: new Item({ key: "ATT_DUPB", itemType: "attachment", itemTypeID: 3,
     fields: { title: "作者 - 年 - 标题.pdf" }, attPath: "storage:作者 - 年 - 标题.pdf", parentItemID: 1001 }),
 
+  /* ---- 外链附件（linkMode 2 = 指向磁盘上的文件，3 = 指向网址） ----
+   * 它们的 attPath 是**绝对路径**，不是 storage:xxx —— 这正是"附件没有 storage 目录"
+   * 那批误报的来源。四条覆盖三种结局：好的、断的、网址。 */
+  LNK_OK1: new Item({ key: "LNK_OK1", itemType: "attachment", itemTypeID: 3, linkMode: 2,
+    fields: { title: "土力学" }, attPath: "D:\\Books\\土力学.pdf", parentItemID: 1000 }),
+  LNK_BRK1: new Item({ key: "LNK_BRK1", itemType: "attachment", itemTypeID: 3, linkMode: 2,
+    fields: { title: "丢了的书" }, attPath: "D:\\Books\\丢了的书.pdf", parentItemID: 1000 }),
+  LNK_BRK2: new Item({ key: "LNK_BRK2", itemType: "attachment", itemTypeID: 3, linkMode: 2,
+    fields: { title: "微生物建造研究进展" },
+    attPath: "E:\\Papers\\微生物建造研究进展.pdf", parentItemID: 1001 }),
+  // 大小写：Windows 上磁盘不区分大小写，扩展名写成 .PDF 是同一份文件。
+  // 匹配不折叠大小写的话这一条永远找不回来（而它看上去只是"用户改名了"）。
+  LNK_BRK3: new Item({ key: "LNK_BRK3", itemType: "attachment", itemTypeID: 3, linkMode: 2,
+    fields: { title: "MICP 综述" },
+    attPath: "E:\\Papers\\MICP 综述.pdf", parentItemID: 1001 }),
+  // 网址型：**不测可达性** —— 那要连网，体检默认不连网。只报数量。
+  LNK_URL1: new Item({ key: "LNK_URL1", itemType: "attachment", itemTypeID: 3, linkMode: 3,
+    fields: { title: "在线补充材料" }, attPath: "https://example.org/supp.pdf", parentItemID: 1001 }),
+
   /* ---- enrich 的夹具。每一条都对应 2026-09-12 真机跑出来的一个案例 ---- */
 
   EN_ATT_SCAN, EN_ATT_TEXT, EN_ATT_PARTIAL, EN_ATT_NONPDF, EN_ATT_BROKEN,
@@ -348,11 +407,54 @@ const Zotero = {
   Collections: {
     getByLibraryAndKey: (lib, key) => COLLECTIONS.find(c => c.key === key) || null,
   },
+  /* 标签替身。rename 里那三个行为**逐字照抄** 2026-09-13 从运行中的 Zotero 读的原码，
+   * 一个都不能省：
+   *   1. 源标签不存在时抛 `Tag '…' not found`（插件靠它把"没这个标签"报成 error）
+   *   2. `UPDATE OR REPLACE itemTags SET tagID=?, **type=0** …` —— 归并把自动标签
+   *      转成手动标签，全部原因就在这个写死的 0 上。stub 里"顺手"保留原 type，
+   *      那条 autoBecomeManual 的断言就变成了自说自话。
+   *   3. 结尾 purge(oldTagID) —— 旧标签整条消失
+   * 结尾那段颜色转移（getColor / setColor）没模拟：插件不读颜色，模拟了也没人看。 */
+  Tags: {
+    getID(name) {
+      const t = TAGS.find(x => x.name === name);
+      return t ? t.id : false;
+    },
+    async rename(libID, oldName, newName) {
+      tagRenames.push([libID, oldName, newName]);
+      const o = String(oldName).trim();
+      const n = String(newName).trim();
+      if (o === n) return;                       // 真实现静默返回，不报错
+      const oid = Zotero.Tags.getID(o);
+      if (!oid) throw new Error(`Tag '${o}' not found`);
+      let nid = Zotero.Tags.getID(n);
+      if (!nid) { nid = tagSeq++; TAGS.push({ id: nid, name: n }); }
+      /* ⚠️ 真 SQL 是 `UPDATE OR REPLACE`，而 itemTags 的**主键是 (itemID, tagID)**
+       * （2026-09-13 从真库的 sqlite_master 里读出来的，不是猜的）——
+       * 所以一个条目本来两样都挂着的话，并完只剩**一行**。
+       * 只改 tagID 不去重，会在同一格上留下两行，而那条断言会挑中先出现的那一行、
+       * 报出一个"没转成手动"的假失败。 */
+      const keep = ITEMTAGS.filter(r => r.tagID !== oid);
+      const moved = ITEMTAGS.filter(r => r.tagID === oid)
+        .map(r => ({ itemID: r.itemID, tagID: nid, type: 0 }));
+      for (const m of moved) {
+        const i = keep.findIndex(x => x.itemID === m.itemID && x.tagID === nid);
+        if (i >= 0) keep.splice(i, 1);          // OR REPLACE：撞主键的旧行被顶掉
+      }
+      ITEMTAGS = keep.concat(moved);
+      TAGS = TAGS.filter(t => t.id !== oid);    // purge(oldTagID)
+    },
+  },
   Items: {
     /* 认的是 item.key，**不是对象属性名** —— 真机的 getByLibraryAndKey 就是按 key 查的。
        之前写成 `ITEMS[key]`，于是夹具的属性名和 key 一旦不一致就静默查不到，
        表现是端点上那句"条目不存在"，而不是抛错，很难看出是 stub 的问题。 */
     getByLibraryAndKeyAsync: async (lib, key) => byItemKey(key),
+    /* 真是**同步**的，而且查不到时返回 **false**（不是 null）—— 2026-09-13 从运行中的
+     * Zotero 读的原码就是 `if (!id) { return false; }`。存根漏了这一个方法的表现是
+     * `TypeError: … is not a function`，被测代码包在 try/catch 里就变成一个 500 的
+     * error 字段；写得再糙一点（比如 catch 成"这个条目跳过"）它就会静默什么都不做。 */
+    getByLibraryAndKey: (lib, key) => byItemKey(key) || false,
     getAsync: async (ids) => (ids || []).map(id => byItemID(id)),
     get: (id) => byItemID(id),
     // 签名照真实现：(libraryID, onlyTopLevel, includeDeleted, asIDs)
@@ -456,6 +558,23 @@ const byItemID = (id) =>
 const byItemKey = (key) =>
   Object.values(ITEMS).find(it => it.key === String(key)) || null;
 
+/* ⚠️ ITEMS 里那几个附件夹具写的 `parentItemID: 1000 / 1001` 是**占位数字**。
+ * itemID 是构造时自增分配的（itemSeq 从 100 起，EN_ATT_* 那批先占掉几个），
+ * 所以 1000 / 1001 从来就没有指向过任何条目 —— 只要没人去 resolve 它就看不出来。
+ * duplicateFilenames 只把 parentItemID 当**分组键**用，所以一直是绿的；
+ * linkedFiles 是第一个真去 `Zotero.Items.get(parentItemID)` 取父条目标题的地方，
+ * 于是它报出来的每一条 title 都是空的，而测试里看不出是夹具的错还是代码的错。
+ * 这里按 **key** 改成真条目 —— 写数字的下一版还会飘。（用 setter 而不是直接
+ * 赋后备字段：挂父级真会触发"摘集合"那条副作用，夹具不该绕开它。） */
+for (const [child, parent] of [
+  ["ATT_DEF1", "MASTER01"], ["ATT_OK1", "MASTER01"],
+  ["ATT_DUPA", "MASTER01"], ["ATT_DUPB", "MASTER01"],
+  ["LNK_OK1", "DUPGOOD"], ["LNK_BRK1", "DUPGOOD"], ["LNK_BRK2", "DUPGOOD"],
+  ["LNK_BRK3", "DUPGOOD"],
+]) {
+  byItemKey(child).parentItemID = byItemKey(parent).itemID;
+}
+
 function collectionsOfItem(itemID) {
   const it = byItemID(itemID);
   return it ? (it.collections || []).map(c => (typeof c === "string" ? colID(c) : c)) : [];
@@ -531,21 +650,26 @@ function dispatch(sql, args, mode) {
       .filter(it => trash.has(it.key) && (it.dateModified || "") >= args[0])
       .map(it => ({ itemID: it.itemID, key: it.key, dateModified: it.dateModified })));
   }
+  /* 「在用的附件 key」集合 —— 孤儿目录就是拿它做差的。
+   * ⚠️ 这条**没有** storage: 过滤（原查询就是 itemID IN (SELECT …itemAttachments)），
+   * 外链附件的 key 也在里面。这是对的：外链附件本来就没有 storage 目录，
+   * 把一个不存在的目录名放进"在用集合"是空操作，而不是漏判。 */
   if (/SELECT key FROM items WHERE itemID IN \(SELECT itemID FROM itemAttachments\)/.test(s)) {
-    return Object.values(ITEMS)
-      .filter(it => it.itemType === "attachment" && (it.attPath || "").startsWith("storage:"))
-      .map(it => it.key);
+    return Object.values(ITEMS).filter(it => it.itemType === "attachment").map(it => it.key);
   }
-  // 两条附件查询靠 SELECT 列表区分：同名文件那条取 parentItemID，标题那条取 idv.value
+  /* 两条附件查询靠 SELECT 列表区分：同名文件那条取 parentItemID，标题那条取 idv.value。
+   * ⚠️ 两条的真 SQL 里都有 `ia.path LIKE 'storage:%'`（bootstrap.js 里那两句），
+   * 所以这里也必须按 storage: 前缀筛，**不能只判 attPath 非空** ——
+   * 少了这个前缀，新加的外链附件夹具会凭空把这两项的计数顶上去。 */
   if (/SELECT ia\.parentItemID AS parent/.test(s)) {
     return pick(Object.values(ITEMS)
-      .filter(it => it.itemType === "attachment" && it.parentItemID && it.attPath)
-      .map(it => ({ parent: it.parentItemID, path: it.attPath, key: it.key })));
+      .filter(it => it.parentItemID && String(it.attachmentPath || "").startsWith("storage:"))
+      .map(it => ({ parent: it.parentItemID, path: it.attachmentPath, key: it.key })));
   }
   if (/SELECT i\.itemID AS itemID, i\.key AS key, idv\.value AS title/.test(s)) {
     return pick(Object.values(ITEMS)
-      .filter(it => it.itemType === "attachment" && it.attPath)
-      .map(it => ({ itemID: it.itemID, key: it.key, title: it.getField("title"), path: it.attPath })));
+      .filter(it => String(it.attachmentPath || "").startsWith("storage:"))
+      .map(it => ({ itemID: it.itemID, key: it.key, title: it.getField("title"), path: it.attachmentPath })));
   }
   if (/SELECT idv.value AS v, COUNT\(\*\) AS n/.test(s)) {
     const field = args[0] === 2 ? "DOI" : "ISBN";
@@ -562,6 +686,43 @@ function dispatch(sql, args, mode) {
     const field = args[0] === 2 ? "DOI" : "ISBN";
     return Object.values(ITEMS).filter(it => it.getField(field) === args[1]).map(it => it.itemID);
   }
+  /* 外链附件（linkMode 2/3）。checkLinkedFiles 一次问两种，storage 端点的 relocate
+   * 只问 LINKED_FILE —— 两条 SQL 只差 `IN (?, ?)` 和 `= ?`，分开接，别合并成一个正则：
+   * 合并之后 relocate 少问一种模式这件事就测不出来了。 */
+  if (/WHERE ia\.linkMode IN \(\?, \?\)$/.test(s)) {
+    return (args || []).map(Number).flatMap(m =>
+      Object.values(ITEMS).filter(it => it.attachmentLinkMode === m).map(it => it.itemID));
+  }
+  if (/WHERE ia\.linkMode = \?$/.test(s)) {
+    return Object.values(ITEMS)
+      .filter(it => it.attachmentLinkMode === Number(args[0])).map(it => it.itemID);
+  }
+  /* checkTagVariants：tags ⋈ itemTags 的聚合。NULL 的边界照 SQL 的语义给，别简化：
+   *   · 一条都没挂的标签 → LEFT JOIN 出**一行全 NULL**，sum 也是 NULL（空集的 sum 是 NULL）
+   *   · 挂了、但全是自动的 → sum(CASE WHEN type=0 …) 是 **0**，不是 NULL（有行，只是没命中）
+   * 这两种在 Number(x) || 0 之后都变成 0，但**在那之前**不一样：Number(null) 是 0、
+   * Number(undefined) 是 NaN。stub 在这里"好心"统一成 0，就把被测代码那一步盖住了。 */
+  if (/FROM tags t LEFT JOIN itemTags it ON it\.tagID = t\.tagID GROUP BY t\.tagID$/.test(s)) {
+    return pick(TAGS.map(t => {
+      const rows = ITEMTAGS.filter(r => r.tagID === t.id);
+      return {
+        id: t.id, name: t.name, n: rows.length,
+        manual: rows.length ? rows.filter(r => r.type === 0).length : null,
+        auto: rows.length ? rows.filter(r => r.type === 1).length : null,
+      };
+    }));
+  }
+  // renameTag 第一条：旧标签挂了多少行、其中多少行是自动的
+  if (/^SELECT type AS t, count\(\*\) AS n FROM itemTags WHERE tagID = \? GROUP BY type$/.test(s)) {
+    const rows = ITEMTAGS.filter(r => r.tagID === Number(args[0]));
+    return pick([0, 1].map(ty => ({ t: ty, n: rows.filter(r => r.type === ty).length }))
+      .filter(x => x.n > 0));
+  }
+  // renameTag 第二条：目标标签已经在的话，有多少行会并进来
+  if (/^SELECT count\(\*\) AS n FROM itemTags WHERE tagID = \?$/.test(s)) {
+    return mode === "rows" ? [{ n: ITEMTAGS.filter(r => r.tagID === Number(args[0])).length }]
+      : ITEMTAGS.filter(r => r.tagID === Number(args[0])).length;
+  }
   if (/^SELECT MAX\(version\) FROM syncCache$/.test(s)) return syncCacheMax;
 
   sqlUnmatched.push(s);
@@ -576,9 +737,137 @@ const backupSizes = {};        // 文件名 → 字节
 const removedBackups = [];     // 轮转删掉的
 let backupDirExists = false;   // 一开始不存在，第一次备份才建
 let vacuumFails = null;        // 设成字符串 → VACUUM INTO 抛这个错
-// storage/ 下的目录名。第一个是 ATT_DEF1 的 key —— 它在用，不该被算成孤儿
-let storageDirs = ["ATT_DEF1", "ZZZZZZZZ", "YYYYYYYY"];
+let moveFailsOn = null;        // 设成目录名 → 搬这一个时 IOUtils.move 抛（造"搬了一半"）
+/* storage/ 的假文件树。原先只有一个目录名数组，加了体积统计和隔离/还原之后不够用了 ——
+ * 那些功能要 stat 出文件、还要 move 整棵子树。所以这里升级成一棵真树。
+ * `setupStorage(null)` 仍然表示「storage 根读不了」，拿来测「单项炸了不影响其余项」。 */
+const DATA_ROOT = "C:\\Users\\you\\Zotero";
+const STORAGE_ROOT = DATA_ROOT + "\\storage";
+const QUARANTINE_ROOT = DATA_ROOT + "\\jsbridge-quarantine";
+/* 三棵目录，每棵都带一个用途：
+ *   ATT_DEF1  在用的那个（ATT_DEFAULT 的 key），**不该**被算成孤儿
+ *   ZZZZZZZZ  孤儿。里面有三种文件：正常内容、**和在用文件字节数相同**的疑似副本、
+ *             以及一个 `.zotero-reader-state` 缓存（可再生，体积要单独算）
+ *   YYYYYYYY  孤儿。一个 87 MB 的大文件 + 一个非 PDF，用来验 byExt 分类 */
+const DEFAULT_STORAGE = {
+  ATT_DEF1: { "paper.pdf": 2048, ".zotero-ft-cache": 11 },
+  ZZZZZZZZ: {
+    "Ch1_微生物建造研究进展.pdf": 2653579,
+    "副本 - paper.pdf": 2048,
+    ".zotero-reader-state": 7,
+  },
+  YYYYYYYY: { "book.pdf": 91234567, "读我.txt": 30 },
+};
+const storageTree = {};
 const basename = (p) => String(p).split(/[\\/]/).pop();
+
+/* 极简虚拟文件系统：路径 → {type, size}。
+ * type 用真实的字面量 —— 普通文件是 **"regular"**，目录是 "directory"。
+ * 写成 "regularFile" 不会抛错，只会让所有文件都不匹配、体积统计出一个自信的 0
+ * （2026-09-13 在真机上这么被骗过一次，mutate.py 里有 mutant 盯着）。 */
+const vfs = new Map();
+const jsonFiles = new Map();     // writeJSON/readJSON 原样往返，不假装会序列化
+function vfsDir(p) { if (!vfs.has(p)) vfs.set(p, { type: "directory", size: -1 }); }
+function vfsFile(p, size) { vfs.set(p, { type: "regular", size: Number(size) || 0 }); }
+function vfsChildren(dir) {
+  const pre = String(dir).replace(/[\\/]+$/, "") + "\\";
+  const out = [];
+  for (const k of vfs.keys()) {
+    if (!k.startsWith(pre)) continue;
+    const rest = k.slice(pre.length);
+    if (rest && rest.indexOf("\\") < 0) out.push(k);
+  }
+  return out;
+}
+function vfsRemoveTree(p) {
+  const pre = String(p).replace(/[\\/]+$/, "") + "\\";
+  for (const k of [...vfs.keys()]) if (k === p || k.startsWith(pre)) vfs.delete(k);
+}
+/* 重建整棵 storage 树。`storageDirs` 上一版是个模块级变量，测试直接改它 —— 升级成 vfs
+ * 之后那一改就**什么也不影响**了（getChildren 读的是 vfs），于是"storage 根读不了"那条
+ * 韧性测试会变成空跑。所以这里把它收成局部变量，外面改不到，只能走这个函数。 */
+function setupStorage(tree) {
+  for (const k of [...vfs.keys()]) {
+    if (k === STORAGE_ROOT || k.startsWith(STORAGE_ROOT + "\\")) vfs.delete(k);
+  }
+  for (const k of Object.keys(storageTree)) delete storageTree[k];
+  if (tree === null || tree === undefined) return;   // 根目录整个不存在 → getChildren 抛
+  for (const d of Object.keys(tree)) storageTree[d] = tree[d];
+  vfsDir(STORAGE_ROOT);
+  for (const d of Object.keys(storageTree)) {
+    const dp = STORAGE_ROOT + "\\" + d;
+    vfsDir(dp);
+    for (const f of Object.keys(storageTree[d])) vfsFile(dp + "\\" + f, storageTree[d][f]);
+  }
+}
+setupStorage(DEFAULT_STORAGE);
+
+/* ---- 外链重定位的"用户把它们搬到哪儿了"目录 ----
+ * 用 D:\Books 而不是 storage/ 底下：外链附件的文件本来就该在库外面，
+ * 拿 storage 当搜索目录是把两种东西混在一起，而这个端点最要紧的边界恰恰是
+ * 「**不碰 storage 那一路**」（见 storageRelocate 上面那段）。
+ * 三个文件里只有 `微生物建造研究进展.pdf` 是真的该被找到的；`丢了书.pdf` 是个
+ * **近似名**，留着验"basename 全等、不做模糊匹配" —— 模糊匹配会"修"出一个错的路径，
+ * 条目看着好了、点开是另一篇，比不修更糟。 */
+const RELOC_ROOT = "D:\\Books";
+function setupReloc(files) {
+  vfsRemoveTree(RELOC_ROOT);
+  vfsDir(RELOC_ROOT);
+  for (const f of files) vfsFile(RELOC_ROOT + "\\" + f.name, f.size);
+}
+/* 一份清单，模块级建一次、测试里建一次 —— 两处各抄一遍的话，
+ * 加了文件只改一边，测试就会拿着旧的树去断言新的数字（这一版就是这么绊了一下）。 */
+const RELOC_FILES = [
+  { name: "土力学.pdf", size: 5242880 },       // LNK_OK1 指向的就是它 —— 这条**不该**被判成断链
+  { name: "丢了书.pdf", size: 111 },            // 近似名，**不该**匹配 LNK_BRK1 想要的「丢了的书.pdf」
+  /* 这一对是**故意**放的：Ch1_ 那份在前，精确的那份在后。
+   * 判据一旦写成 includes() 之类的模糊匹配，先撞上的就是 Ch1_ 那份 —— 于是
+   * 「修」出来的路径指着另一篇，条目看着好了、点开是别的，比不修更糟。
+   * 真库上就是这么一对：孤儿目录里有 8 份 `Ch1_微生物建造研究进展.pdf`，
+   * 而库里的真本叫「史 等 - 2025 - 微生物建造研究进展与趋势.pdf」。 */
+  { name: "Ch1_微生物建造研究进展.pdf", size: 2653579 },
+  { name: "微生物建造研究进展.pdf", size: 2653579 }, // 精确匹配 LNK_BRK2
+  { name: "MICP 综述.PDF", size: 8888 },        // 大小写不同 —— Windows 上是同一份，该匹配 LNK_BRK3
+  { name: "无关文件.txt", size: 12 },
+];
+setupReloc(RELOC_FILES);
+/* ---- 标签夹具 ----
+ * tags / itemTags 是两张表，形状不一样，这正是 checkTagVariants 难写的地方：
+ *   · tags 是**全局**的 —— 实测没有 libraryID 列（3467 行，`SELECT … libraryID` 直接报错）
+ *   · itemTags 是 (itemID, tagID, type)，type 0 = 手动、1 = 自动
+ * 下面这几组照着真库上实测的重复形态挑：大小写一对、标点一对，外加两个**不该被并进来**的
+ * 反例（一个独立标签、一个一条都没挂的孤儿标签 —— 孤儿走 LEFT JOIN 会得到一行全 NULL）。
+ * 一条都没挂的标签必须留着：它专门验 sum(CASE…) 的 NULL 那个边界。 */
+const TAG_SPEC = [
+  { id: 1, name: "Deep Learning" },
+  { id: 2, name: "deep learning" },      // 只差大小写，和 1 一组
+  { id: 3, name: "MICP" },
+  { id: 4, name: "MICP." },              // 只差一个句点，和 3 一组
+  { id: 5, name: "深度学习" },            // 独立标签，不该出现在任何一组里
+  { id: 6, name: "孤儿标签" },            // 0 条 itemTags —— LEFT JOIN 的 NULL 边界
+];
+// [条目 key, tagID, type]。用 key 而不是 itemID：itemID 是构造时自增分配的，
+// 抄死数字的话，夹具顺序一改这几行就指向别的条目了 —— 而且不会报错，只会改结论。
+const ITEMTAG_SPEC = [
+  ["MASTER01", 1, 1], ["DUPGOOD", 1, 1],      // Deep Learning：2 行，全是自动
+  ["DUPGOOD", 2, 1],                          // deep learning：1 行，自动
+  ["MASTER01", 3, 1], ["DUPBAD_TITLE", 3, 1], // MICP：2 行，全是自动
+  ["DUPINTASH", 4, 0],                        // MICP.：1 行，**手动** —— 归并后不该被算进 autoBecomeManual
+  ["APPTITLE", 5, 0],                         // 深度学习：1 行
+];
+let TAGS = [], ITEMTAGS = [], tagSeq = 0;
+const tagRenames = [];   // 每次真调 Zotero.Tags.rename 记一笔 —— 预演里不该有东西进来
+function setupTags() {
+  tagRenames.length = 0;
+  TAGS = TAG_SPEC.map(t => Object.assign({}, t));
+  ITEMTAGS = ITEMTAG_SPEC.map(([key, tagID, type]) =>
+    ({ itemID: byItemKey(key).itemID, tagID, type }));
+  tagSeq = 100;
+}
+/* 归并前后要对比，所以夹具得能重建 —— 真写那几次会把 TAGS/ITEMTAGS 改掉。
+ * 和 setupStorage 是同一个套路。（**在测试里重建，不在被测代码里重建**：
+ * 这里是 stub 的状态，不是插件该管的东西。） */
+setupTags();
 
 /* ---- Zotero.Search 的替身 ---- */
 const searchCalls = [];        // 每次 search 的条件，用来断言端点确实传对了
@@ -666,24 +955,65 @@ const sandboxGlobals = {
     writeUTF8: async (p, c) => { tokenWrites.push([p, c]); },
     // token 文件用 tokenFileOnDisk 控制；备份文件查真的那个列表
     exists: async (p) => (String(p).includes("zoterojs-token")
-      ? tokenFileOnDisk : backupFiles.includes(basename(p))),
+      ? tokenFileOnDisk : vfs.has(p) || backupFiles.includes(basename(p))),
     // 目录不存在就抛 —— 真实 IOUtils.getChildren 就是抛，listBackups 的 catch 靠它
     getChildren: async (dir) => {
       if (basename(dir) === BACKUP_SUBDIR) {
         if (!backupDirExists) throw new Error("NS_ERROR_FILE_NOT_FOUND");
         return backupFiles.map(f => dir + "\\" + f);
       }
-      if (basename(dir) === "storage") return storageDirs.map(d => dir + "\\" + d);
-      throw new Error("NS_ERROR_FILE_NOT_FOUND");
+      const n = vfs.get(dir);
+      if (!n || n.type !== "directory") throw new Error("NS_ERROR_FILE_NOT_FOUND");
+      return vfsChildren(dir);
     },
-    makeDirectory: async () => { backupDirExists = true; },
+    // 真 IOUtils.makeDirectory 会把中间层一起建出来（否则第一个时间戳目录建下去、
+    // 隔离区的父目录还是不存在，list 一读就抛，报出来是"隔离区是空的"）。
+    makeDirectory: async (p) => {
+      backupDirExists = true;
+      const parts = String(p).split("\\");
+      for (let i = 1; i <= parts.length; i++) vfsDir(parts.slice(0, i).join("\\"));
+    },
     remove: async (p) => {
+      if (vfs.has(p)) { vfsRemoveTree(p); jsonFiles.delete(p); return; }
       const i = backupFiles.indexOf(basename(p));
       if (i < 0) throw new Error("NS_ERROR_FILE_NOT_FOUND");
       backupFiles.splice(i, 1);
       removedBackups.push(basename(p));
     },
-    stat: async (p) => ({ size: backupSizes[basename(p)] ?? 0 }),
+    // type 的字面量照抄真机：普通文件 "regular"，目录 "directory"。
+    // 备份目录那条支路保留原来的宽松行为（查不到就是 0 字节），别把轮转的测试带塌。
+    stat: async (p) => {
+      const n = vfs.get(p);
+      if (n) return { type: n.type, size: n.size, path: p };
+      if (String(p).indexOf(BACKUP_SUBDIR) >= 0) {
+        return { type: "regular", size: backupSizes[basename(p)] ?? 0, path: p };
+      }
+      throw new Error("NS_ERROR_FILE_NOT_FOUND");
+    },
+    // 整棵子树一起搬，目标已存在就抛（真 IOUtils.move 就是这样，不静默覆盖）
+    move: async (from, to) => {
+      if (moveFailsOn && String(from).endsWith("\\" + moveFailsOn)) {
+        throw new Error("NS_ERROR_FILE_ACCESS_DENIED");
+      }
+      if (!vfs.has(from)) throw new Error("NS_ERROR_FILE_NOT_FOUND");
+      if (vfs.has(to)) throw new Error("NS_ERROR_FILE_EXISTS");
+      const pre = from + "\\";
+      const victims = [...vfs.keys()].filter(k => k === from || k.startsWith(pre));
+      const parent = to.split("\\").slice(0, -1).join("\\");
+      if (parent) vfsDir(parent);
+      for (const k of victims) {
+        vfs.set(to + k.slice(from.length), vfs.get(k));
+        vfs.delete(k);
+      }
+    },
+    writeJSON: async (p, o) => {
+      jsonFiles.set(p, JSON.stringify(o));
+      vfsFile(p, JSON.stringify(o).length);
+    },
+    readJSON: async (p) => {
+      if (!jsonFiles.has(p)) throw new Error("NS_ERROR_FILE_NOT_FOUND");
+      return JSON.parse(jsonFiles.get(p));
+    },
   },
   Cu: { Sandbox: () => ({}), evalInSandbox: () => { throw new Error("不该走沙箱退路"); } },
   Ci: {}, Cc: {}, OS: {},
@@ -758,10 +1088,11 @@ const t = async (name, fn) => {
   });
 
   console.log("\n[1] 端点注册");
-  await t("八个路径都注册上了", () => {
+  await t("九个路径都注册上了", () => {
     assert.deepStrictEqual(Object.keys(EP).sort(),
       ["/zoterojs/apply", "/zoterojs/doctor", "/zoterojs/enrich", "/zoterojs/exec",
-        "/zoterojs/logs", "/zoterojs/merge", "/zoterojs/ping", "/zoterojs/query"]);
+        "/zoterojs/logs", "/zoterojs/merge", "/zoterojs/ping", "/zoterojs/query",
+        "/zoterojs/storage"]);
   });
   await t("都是构造函数（server.js 里是 new this.endpoint()）", () => {
     for (const p of Object.keys(EP)) assert.ok(typeof new EP[p]().init === "function");
@@ -1098,7 +1429,7 @@ const t = async (name, fn) => {
   await t("面板每个 preference= 都在 prefs.js 里有默认值", () => {
     // 先剥掉 XML 注释 —— 注释里那句 preference="..." 是说明文字，不是绑定
     const x = fs.readFileSync(path.join(ADDON, "prefs.xhtml"), "utf8").replace(/<!--[\s\S]*?-->/g, "");
-    // 十三个可调参数：总开关、只读、八个端点、响应上限、备份开关与保留份数。
+    // 十四个可调参数：总开关、只读、九个端点、响应上限、备份开关与保留份数。
     // token 不在其中 —— 那个框是只读展示，由 JSBridge.refreshTokenView 填，不走 preference 绑定。
     // enrich 的 minChars 也不在：它没做成面板控件（改的人先得知道自己在改什么），
     // 只由 prefs.js 给默认值，需要时用 about:config 调。
@@ -1113,6 +1444,7 @@ const t = async (name, fn) => {
       "extensions.zotero.jsbridge.endpoint.doctor",
       "extensions.zotero.jsbridge.endpoint.apply",
       "extensions.zotero.jsbridge.endpoint.enrich",
+      "extensions.zotero.jsbridge.endpoint.storage",
       "extensions.zotero.jsbridge.limit.responseKB",
       "extensions.zotero.jsbridge.backup.enabled",
       "extensions.zotero.jsbridge.backup.keep",
@@ -1148,7 +1480,7 @@ const t = async (name, fn) => {
       assert.strictEqual(typeof pane()[f], "function", `缺 ${f}`);
     }
   });
-  await t("自检报出八个端点、总开关、只读、token 文件和备份状态", async () => {
+  await t(`自检报出 ${Object.keys(EP).length} 个端点、总开关、只读、token 文件和备份状态`, async () => {
     const doc = fakeDoc();
     await pane().selfCheck(doc);
     const out = doc.els["jsb-status"].textContent;
@@ -1195,7 +1527,9 @@ const t = async (name, fn) => {
     assert.strictEqual(stale[0], 403, "旧 token 还能用");
   });
 
-  await t("总开关关掉 → 八个端点全 503，且说得出是哪个开关", () =>
+  // 个数从 EP 现算，不写死：加一个端点就要回来改一次标题的话，
+  // 迟早会留下一句和实际不符的话（上一版就写着"八个"）
+  await t(`总开关关掉 → ${Object.keys(EP).length} 个端点全 503，且说得出是哪个开关`, () =>
     withPref("jsbridge.enabled", false, async () => {
       for (const p of Object.keys(EP)) {
         const r = await epCall(p, { method: "GET", headers: H,
@@ -1394,7 +1728,7 @@ const t = async (name, fn) => {
     assert.ok(keys.includes("UNFILED1") && keys.includes("UNFILED2"), keys.join());
   });
   await t("orphanStorage：认得出哪些 storage 目录还在用，别把在用的算成孤儿", async () => {
-    storageDirs = ["ATT_DEF1", "ZZZZZZZZ", "YYYYYYYY"];   // 第一个是 ATT_DEFAULT 的 key
+    setupStorage(DEFAULT_STORAGE);   // ATT_DEF1 是 ATT_DEFAULT 的 key，另两个没条目认领
     const r = await epCall("/zoterojs/doctor", { headers: H,
       searchParams: new URLSearchParams("checks=orphanStorage") });
     const o = JSON.parse(r[2]).checks.orphanStorage;
@@ -1488,7 +1822,7 @@ const t = async (name, fn) => {
     assert.deepStrictEqual(saveTxCalls, [], "体检动了数据");
   });
   await t("单项炸了不影响其余项，且如实报出是哪项炸的", async () => {
-    storageDirs = null;   // IOUtils.getChildren 会抛
+    setupStorage(null);   // storage 根整个不存在 → IOUtils.getChildren 会抛
     try {
       const r = await epCall("/zoterojs/doctor", { headers: H });
       const b = JSON.parse(r[2]);
@@ -1496,7 +1830,118 @@ const t = async (name, fn) => {
       assert.ok(b.checks.orphanStorage.error, "该报出这一项的错误");
       assert.ok(b.checks.unfiled, "后面几项该照跑不误");
       assert.ok(!b.checks.unfiled.error, b.checks.unfiled.error);
-    } finally { storageDirs = ["ATT_DEF1", "ZZZZZZZZ", "YYYYYYYY"]; }
+    } finally { setupStorage(DEFAULT_STORAGE); }
+  });
+
+  console.log("\n[8.65] doctor —— 孤儿体积 / 外链附件 / 标签变体");
+  await t("orphanStorage：体积按**内容**和**缓存**分开算，缓存不算占地方", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=orphanStorage") });
+    const o = JSON.parse(r[2]).checks.orphanStorage;
+    // 夹具里的精确字节数：2653579 + 2048 + 7(缓存) + 91234567 + 30
+    assert.strictEqual(o.scanned, 3);
+    assert.strictEqual(o.count, 2);
+    assert.strictEqual(o.files, 5, "孤儿那两棵树里一共 5 个文件");
+    assert.strictEqual(o.bytes, 93890231);
+    assert.strictEqual(o.cacheFiles, 1, "只有 .zotero-reader-state 算缓存");
+    assert.strictEqual(o.contentFiles, 4);
+    assert.strictEqual(o.contentBytes, 93890224, "content 那一组要减掉缓存的 7 字节");
+    assert.strictEqual(o.mb, o.contentMB, "夹具里缓存太小，两个 MB 数会撞在一起，这是对的");
+    // 分类只算内容文件：缓存不该出现在任何扩展名下
+    assert.strictEqual(o.byExt.pdf.files, 3);
+    assert.strictEqual(o.byExt.pdf.bytes, 93890194);
+    assert.strictEqual(o.byExt.txt.files, 1);
+    assert.strictEqual(o.byExt["(无扩展名)"], undefined);
+  });
+  await t("★ orphanStorage：目录遍历的 type 判据写错会静默给出 0 —— 这条守着它", async () => {
+    /* IOUtils.stat().type 对普通文件是 **"regular"**，不是 "regularFile"。
+     * 2026-09-13 在真机上写成分不清的那个字面量，得到的是一个自信的 orphanMB: 0 ——
+     * 不抛错、不打日志，体积那一栏永远是空的。所以这条断言盯的不是数字好不好看，
+     * 是"它到底有没有在数"。stub 的 stat 照抄真字面量，这里再钉一次非零。 */
+    setupStorage(DEFAULT_STORAGE);
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=orphanStorage") });
+    const o = JSON.parse(r[2]).checks.orphanStorage;
+    assert.ok(o.bytes > 0 && o.contentBytes > 0 && o.files > 0,
+      "全是 0 —— 先去查 IOUtils.stat 的 type 字面量，别去查夹具");
+  });
+  await t("orphanStorage deep：字节数相同的才算疑似副本，同尺寸也不是证据", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=orphanStorage&deep=1") });
+    const d = JSON.parse(r[2]).checks.orphanStorage.deep;
+    // 在用的 paper.pdf 是 2048 字节 → 「副本 - paper.pdf」撞上了；另外三个没有
+    assert.strictEqual(d.duplicateBySize, 1);
+    assert.strictEqual(d.unmatchedBySize, 3);
+    assert.strictEqual(d.duplicateMB, 0, "2048 字节四舍五入到一位小数就是 0.0 —— 别把它读成没算");
+    assert.strictEqual(d.unmatchedMB, 89.5);
+    assert.ok(d.note.includes("不构成证据"), "报出来的是线索，得说明白");
+  });
+  await t("orphanStorage 不给 deep 就不遍历在用的那批（全量遍历实测会超时）", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=orphanStorage") });
+    assert.strictEqual(JSON.parse(r[2]).checks.orphanStorage.deep, undefined);
+  });
+  await t("★ linkedFiles：好的、断的、网址三种分开报，且不测网址的可达性", async () => {
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=linkedFiles") });
+    const l = JSON.parse(r[2]).checks.linkedFiles;
+    assert.strictEqual(l.total, 5, "linkMode 2 四条 + linkMode 3 一条");
+    assert.strictEqual(l.okCount, 1);
+    assert.strictEqual(l.ok[0].key, "LNK_OK1");
+    assert.strictEqual(l.brokenCount, 3);
+    assert.deepStrictEqual(l.broken.map(b => b.key).sort(), ["LNK_BRK1", "LNK_BRK2", "LNK_BRK3"]);
+    assert.strictEqual(l.urlCount, 1);
+    assert.strictEqual(l.urls[0].key, "LNK_URL1");
+    assert.ok(l.note.includes("别把它算进孤儿里"),
+      "这一项存在的理由就是解释孤儿那批为什么有一堆假阳");
+    assert.ok(l.note.includes("relocate"), "断链怎么修要写清楚，不然会有人去重建附件");
+  });
+  await t("linkedFiles：断链条目带上父条目标题，好知道是哪篇", async () => {
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=linkedFiles") });
+    const b = JSON.parse(r[2]).checks.linkedFiles.broken.find(x => x.key === "LNK_BRK2");
+    assert.strictEqual(b.title, "某篇论文", "父条目是 MASTER01");
+    assert.strictEqual(b.path, "E:\\Papers\\微生物建造研究进展.pdf");
+  });
+  await t("★ tagVariants：大小写和标点各成一组，孤儿标签不许混进来", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=tagVariants") });
+    const v = JSON.parse(r[2]).checks.tagVariants;
+    assert.strictEqual(v.groups, 2, "只有 Deep Learning 和 MICP 两组");
+    assert.strictEqual(v.variants, 4, "两组各两个变体");
+    const names = v.sample.flat().map(x => x.name);
+    assert.ok(names.includes("Deep Learning") && names.includes("deep learning"));
+    assert.ok(names.includes("MICP") && names.includes("MICP."));
+    assert.ok(!names.includes("深度学习"), "独立标签不该被并进任何一组");
+    assert.ok(!names.includes("孤儿标签"), "一条都没挂的标签左边连接出来是一行 NULL，不是一组");
+  });
+  await t("★ tagVariants：把「归并会转手动」这件事连数字一起报出来，不留人自己发现", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=tagVariants") });
+    const v = JSON.parse(r[2]).checks.tagVariants;
+    // 两组里 type=1 的行：Deep Learning 2 行 + deep learning 1 行 + MICP 2 行 = 5；MICP. 那行是手动的
+    assert.strictEqual(v.autoTagRows, 5);
+    assert.strictEqual(v.manualTagRows, 1);
+    assert.ok(v.note.includes("转成手动"), "这是这条检查唯一会让人吃惊的地方");
+    const g = v.sample.find(x => x[0].name === "MICP");
+    assert.strictEqual(g.find(x => x.name === "MICP").auto, 2);
+    assert.strictEqual(g.find(x => x.name === "MICP.").manual, 1);
+  });
+  await t("tagVariants：孤儿标签的 manual/auto 是 NULL，不能变成 NaN", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=tagVariants") });
+    // 孤儿标签是单独一组（组大小 1），会被滤掉 —— 这里要验的是它**没参与**统计，
+    // 而不是它算出来是多少。把 NULL 当数字加的话 autoTagRows 会变成 NaN。
+    const v = JSON.parse(r[2]).checks.tagVariants;
+    assert.strictEqual(typeof v.autoTagRows, "number");
+    assert.ok(Number.isFinite(v.autoTagRows), `autoTagRows 是 ${v.autoTagRows}`);
+    assert.ok(Number.isFinite(v.manualTagRows));
   });
 
   console.log("\n[8.7] apply —— 批量写 + 集合差分");
@@ -1669,6 +2114,314 @@ const t = async (name, fn) => {
     assert.strictEqual(r[0], 400);
     assert.ok(JSON.parse(r[2]).error.includes("ops"));
   });
+
+  console.log("\n[8.75] apply 的 tags —— 标签归并（库级写入）");
+  await t("★ 预演要预告「这一并把几个自动标签转成手动」，不能只说会合并", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true, tags: [{ from: "deep learning", to: "Deep Learning" }] } });
+    const b = JSON.parse(r[2]);
+    const rec = b.tags[0];
+    assert.strictEqual(rec.status, "would-merge");
+    assert.strictEqual(rec.items, 1, "deep learning 挂了一条");
+    assert.strictEqual(rec.autoBecomeManual, 1, "那一条是自动标签，归并后会被转成手动");
+    assert.strictEqual(b.tagsMerged, 0, "预演不该报 merged");
+    assert.ok(b.warning.includes("转成手动"), "这事必须当场说出来");
+    assert.deepStrictEqual(tagRenames, [], "预演就调了 rename");
+  });
+  await t("★ 真写：自动标签真的被转成手动（照抄 rename 里那个写死的 type=0）", async () => {
+    setupTags();
+    // 归并前：tagID 2 这一行是 type=1（自动）
+    assert.strictEqual(ITEMTAGS.find(r2 => r2.tagID === 2).type, 1);
+    let backupReason = null;
+    await withPref("jsbridge.backup.enabled", true, async () => {
+      const r = await epCall("/zoterojs/apply", { headers: H, data: {
+        tags: [{ from: "deep learning", to: "Deep Learning" }] } });
+      const b = JSON.parse(r[2]);
+      assert.strictEqual(b.tagsMerged, 1);
+      assert.strictEqual(b.tags[0].status, "merged");
+      backupReason = b.backup && b.backup.reason;
+    });
+    assert.strictEqual(backupReason, "tags", "库级写入也得走备份，理由那一栏要写清是哪些");
+    // 这一行现在挂在目标标签下，**而且 type 变成了 0**
+    assert.deepStrictEqual(tagRenames, [[1, "deep learning", "Deep Learning"]]);
+    const deepId = TAGS.find(t2 => t2.name === "Deep Learning").id;
+    // DUPGOOD 本来两样都挂着（Deep Learning 自动 + deep learning 自动）。
+    // itemTags 的主键是 (itemID, tagID)，OR REPLACE 之后**只剩一行**。
+    const rows = ITEMTAGS.filter(r2 => r2.itemID === ITEMS.DUPGOOD.itemID && r2.tagID === deepId);
+    assert.strictEqual(rows.length, 1, "UPDATE OR REPLACE 撞主键会顶掉旧行，不是变成两行");
+    assert.strictEqual(rows[0].type, 0, "type=0 就是「转成手动」的全部含义，stub 里不许美化掉");
+    assert.strictEqual(TAGS.find(t2 => t2.name === "deep learning"), undefined, "旧标签要 purge 掉");
+    setupTags();
+  });
+  await t("目标标签已经存在时不是错误：报出会并进来几行", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true, tags: [{ from: "deep learning", to: "Deep Learning" }] } });
+    const rec = JSON.parse(r[2]).tags[0];
+    assert.strictEqual(rec.mergesIntoExisting, 2, "Deep Learning 上本来就有 2 行");
+  });
+  await t("目标标签不存在 → 只报出会新建，不报 mergesIntoExisting", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true, tags: [{ from: "MICP", to: "micp" }] } });
+    const rec = JSON.parse(r[2]).tags[0];
+    assert.strictEqual(rec.mergesIntoExisting, undefined);
+    assert.strictEqual(rec.autoBecomeManual, 2, "MICP 上那两行都是自动的");
+  });
+  await t("源标签不存在 → 那一条报 error，不拖累同一批的其余条", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true, tags: [{ from: "没这个标签", to: "X" }, { from: "MICP.", to: "MICP" }] } });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.tags[0].status, "error");
+    assert.match(b.tags[0].why, /不存在|not found/);
+    assert.strictEqual(b.tags[1].status, "would-merge", "前一条炸了不该挡住后一条");
+    assert.strictEqual(b.tagsErrors, 1);
+  });
+  await t("from === to → no-change，不白写一次也不报错", async () => {
+    setupTags();
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true, tags: [{ from: "  MICP  ", to: "MICP" }] } });
+    assert.strictEqual(JSON.parse(r[2]).tags[0].status, "no-change",
+      "两头都要 trim —— 真实现的 rename 就是这么比的");
+  });
+  await t("tags 和 ops 可以同一次传，各报各的", async () => {
+    setupTags();
+    saveTxCalls.length = 0;
+    const r = await epCall("/zoterojs/apply", { headers: H, data: {
+      dryRun: true,
+      ops: [{ item: "APPTITLE", set: { title: "又改一次" } }],
+      tags: [{ from: "MICP.", to: "MICP" }] } });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.report.length, 1);
+    assert.strictEqual(b.tags.length, 1);
+    assert.deepStrictEqual(saveTxCalls, []);
+  });
+  await t("只给 tags 不给 ops 时，备份的理由是 tags 而不是 apply", async () => {
+    setupTags();
+    let reason = null;
+    await withPref("jsbridge.backup.enabled", true, async () => {
+      const r = await epCall("/zoterojs/apply", { headers: H, data: {
+        tags: [{ from: "MICP.", to: "MICP" }] } });
+      reason = JSON.parse(r[2]).backup.reason;
+    });
+    assert.strictEqual(reason, "tags");
+    setupTags();
+  });
+  await t("两个都不给 → 400，且把两种形状都写出来", async () => {
+    const r = await epCall("/zoterojs/apply", { headers: H, data: { ops: [], tags: [] } });
+    assert.strictEqual(r[0], 400);
+    const e = JSON.parse(r[2]).error;
+    assert.ok(e.includes("ops") && e.includes("tags"), e);
+  });
+
+  console.log("\n[8.78] storage —— 孤儿目录隔离 / 还原、断链外链重定位");
+  const ST = (data) => epCall("/zoterojs/storage", { headers: H, data });
+  await t("op 不认识 → 400，并把四个合法 op 列出来", async () => {
+    const r = await ST({ op: "乱写的" });
+    assert.strictEqual(r[0], 400);
+    ["list", "quarantine", "restore", "relocate"].forEach(o =>
+      assert.ok(JSON.parse(r[2]).error.includes(o), `没列出 ${o}`));
+  });
+  await t("list：隔离区还没建过时是空的，不是错误", async () => {
+    vfsRemoveTree(QUARANTINE_ROOT);
+    jsonFiles.clear();
+    const r = await ST({ op: "list" });
+    assert.strictEqual(r[0], 200);
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.ok, true);
+    assert.strictEqual(b.count, 0);
+    assert.ok(b.note.includes("manifest.json"), "说清楚 restore 是靠什么搬回去的");
+  });
+  await t("★ quarantine 默认只预演：列出会动哪些目录、多大，一个文件都不碰", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    vfsRemoveTree(QUARANTINE_ROOT);
+    const r = await ST({ op: "quarantine" });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.ok, true);
+    assert.strictEqual(b.dryRun, true, "不传 dryRun 就是预演 —— 和 apply 一个纪律");
+    assert.strictEqual(b.dirs, 2);
+    /* ⚠️ 这两个数是**整棵目录**的（含 .zotero-reader-state 那个缓存），和 doctor
+     * 那边不一样 —— 那边分开报 content / cache，是因为它回答的是"真占地方的是多少"；
+     * 这边搬的是整个目录，缓存跟着走，所以报全量才是"会腾出多少"。 */
+    assert.strictEqual(b.files, 5, "ZZZZZZZZ 三个（含缓存）+ YYYYYYYY 两个");
+    assert.strictEqual(b.bytes, 93890231, "整棵目录的字节数");
+    assert.ok(vfs.has(STORAGE_ROOT + "\\ZZZZZZZZ"), "预演就把目录搬走了");
+  });
+  await t("★ 真写要两道闸：dryRun:false 单独还不够，必须再加 confirm", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    const r = await ST({ op: "quarantine", dryRun: false });
+    assert.strictEqual(r[0], 400);
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.ok, false, "拒绝了就得说 ok:false，不能嘴上拒绝、回一个 ok:true");
+    assert.ok(b.error.includes("confirm"), b.error);
+    assert.ok(b.error.includes("VACUUM"), "要说清楚为什么它比 apply 多一道闸");
+    assert.ok(vfs.has(STORAGE_ROOT + "\\ZZZZZZZZ"), "没确认就把目录搬了");
+  });
+  await t("★ 两道闸都过：目录搬进隔离区、manifest 落盘、给出 undo 命令", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    vfsRemoveTree(QUARANTINE_ROOT);
+    jsonFiles.clear();
+    const r = await ST({ op: "quarantine", dryRun: false, confirm: true });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.ok, true);
+    assert.strictEqual(b.dryRun, false);
+    assert.strictEqual(b.quarantined, 2);
+    assert.strictEqual(b.failed, 0);
+    assert.ok(!vfs.has(STORAGE_ROOT + "\\ZZZZZZZZ"), "搬走了却还在原地");
+    assert.ok(vfs.has(b.root + "\\ZZZZZZZZ\\Ch1_微生物建造研究进展.pdf"), "文件内容要跟着走");
+    assert.ok(vfs.has(STORAGE_ROOT + "\\ATT_DEF1"), "在用的那棵被搬了");
+    assert.ok(b.undo.includes("restore") && b.undo.includes(b.stamp),
+      "撤销命令要能直接抄走，别让人自己去拼 stamp");
+    const mf = jsonFiles.get(b.root + "\\manifest.json");
+    assert.ok(mf, "没写 manifest，restore 就无从下手");
+    const m2 = JSON.parse(mf);
+    assert.strictEqual(m2.dirs.length, 2);
+    assert.strictEqual(m2.files, 5);
+    assert.strictEqual(m2.bytes, 93890231, "manifest 里的体积要按**真搬成功的**那批重算");
+    assert.strictEqual(m2.from, STORAGE_ROOT, "得记住原来在哪，不然搬回去是猜的");
+  });
+  await t("list 看得到刚隔离的那一批，带目录数 / 体积 / 时间", async () => {
+    const r = await ST({ op: "list" });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.count, 1);
+    assert.strictEqual(b.stamps[0].dirs, 2);
+    assert.strictEqual(b.stamps[0].mb, 89.5);
+    assert.ok(b.stamps[0].at, "时间要报出来，否则一堆时间戳分不清哪次是哪次");
+  });
+  await t("★ restore：同样两道闸，缺 stamp 要报错而不是随便挑一个", async () => {
+    assert.strictEqual((await ST({ op: "restore", dryRun: false, confirm: true }))[0], 400);
+    const r = await ST({ op: "restore", stamp: "没这个时间戳", dryRun: true });
+    assert.strictEqual(r[0], 400);
+    assert.match(JSON.parse(r[2]).error, /manifest/);
+  });
+  await t("★ restore 预演不动文件；真写把目录搬回原位并删掉 manifest", async () => {
+    const st = JSON.parse((await ST({ op: "list" }))[2]).stamps[0].stamp;
+    assert.strictEqual((await ST({ op: "restore", stamp: st }))[2] &&
+      JSON.parse((await ST({ op: "restore", stamp: st }))[2]).dryRun, true);
+    assert.strictEqual((await ST({ op: "restore", stamp: st, dryRun: false }))[0], 400,
+      "没有 confirm 一样要拒");
+    assert.ok(!vfs.has(STORAGE_ROOT + "\\ZZZZZZZZ"), "预演不该搬回去");
+
+    const r = await ST({ op: "restore", stamp: st, dryRun: false, confirm: true });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.restored, 2);
+    assert.strictEqual(b.failed, 0);
+    assert.ok(vfs.has(STORAGE_ROOT + "\\ZZZZZZZZ\\Ch1_微生物建造研究进展.pdf"));
+    assert.ok(vfs.has(STORAGE_ROOT + "\\YYYYYYYY\\book.pdf"));
+    assert.strictEqual(b.partial, undefined, "全搬回去了就不该留 partial");
+    assert.strictEqual(JSON.parse((await ST({ op: "list" }))[2]).stamps[0].manifest, "读不到",
+      "manifest 只在**全部搬回去之后**才删");
+  });
+  await t("★ restore：目标已经在了就如实报失败，不硬搬、不悄悄跳过", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    vfsRemoveTree(QUARANTINE_ROOT);
+    jsonFiles.clear();
+    const q = JSON.parse((await ST({ op: "quarantine", dryRun: false, confirm: true }))[2]);
+    // 手工把其中一个目录放回去，制造「目标已存在」
+    vfsDir(STORAGE_ROOT + "\\ZZZZZZZZ");
+    vfsFile(STORAGE_ROOT + "\\ZZZZZZZZ\\Ch1_微生物建造研究进展.pdf", 2653579);
+    const r = await ST({ op: "restore", stamp: q.stamp, dryRun: false, confirm: true });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.restored, 1, "YYYYYYYY 该搬回去");
+    assert.strictEqual(b.failed, 1);
+    assert.strictEqual(b.failedSample[0].dir, "ZZZZZZZZ");
+    assert.ok(b.partial.includes("再来一次"), "没搬完要留话，manifest 也得留着");
+    assert.ok(jsonFiles.has(q.root + "\\manifest.json"));
+    // 收尾：把那棵多出来的删掉，restore 一次把状态弄干净
+    vfsRemoveTree(STORAGE_ROOT + "\\ZZZZZZZZ");
+    await ST({ op: "restore", stamp: q.stamp, dryRun: false, confirm: true });
+  });
+  await t("★ 隔离搬了一半：如实报失败，manifest 只记搬成了的那批（不许虚报体积）", async () => {
+    setupStorage(DEFAULT_STORAGE);
+    vfsRemoveTree(QUARANTINE_ROOT);
+    jsonFiles.clear();
+    moveFailsOn = "YYYYYYYY";           // 搬第二个时炸
+    let q;
+    try { q = JSON.parse((await ST({ op: "quarantine", dryRun: false, confirm: true }))[2]); }
+    finally { moveFailsOn = null; }
+    assert.strictEqual(q.quarantined, 1);
+    assert.strictEqual(q.failed, 1);
+    assert.strictEqual(q.failedSample[0].dir, "YYYYYYYY");
+    assert.ok(vfs.has(STORAGE_ROOT + "\\YYYYYYYY"), "没搬成的要留在原地，别假装成功了");
+    const mf = JSON.parse(jsonFiles.get(q.root + "\\manifest.json"));
+    assert.strictEqual(mf.dirs.length, 1, "manifest 记多了，restore 会去搬一个不存在的目录");
+    assert.strictEqual(mf.bytes, 2655634, "体积要按搬成了的那批重算，不能抄全量");
+    assert.strictEqual(mf.files, 3);
+    // 收尾：把状态弄回去
+    await ST({ op: "restore", stamp: q.stamp, dryRun: false, confirm: true });
+  });
+  await t("relocate 不给 dir → 400（不扫全盘是刻意的）", async () => {
+    const r = await ST({ op: "relocate" });
+    assert.strictEqual(r[0], 400);
+    assert.ok(JSON.parse(r[2]).error.includes("dir"));
+  });
+  await t("★ relocate 预演：只有 basename **全等**的才算匹配，近似名不算", async () => {
+    setupReloc(RELOC_FILES);
+    const r = await ST({ op: "relocate", dir: RELOC_ROOT });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.ok, true);
+    assert.strictEqual(b.dryRun, true);
+    assert.strictEqual(b.searched, RELOC_ROOT);
+    assert.strictEqual(b.scanned, 6);
+    assert.strictEqual(b.broken, 3, "LNK_OK1 有文件，不算断；网址型根本不进这一项");
+    assert.strictEqual(b.matched, 2, "LNK_BRK2 和 LNK_BRK3 找得到，LNK_BRK1 是近似名");
+    const plan = Object.fromEntries(b.plan.map(x => [x.key, x.found]));
+    assert.strictEqual(plan.LNK_BRK1, null, "模糊匹配会「修」出一个错的路径，比不修更糟");
+    assert.strictEqual(plan.LNK_BRK2, RELOC_ROOT + "\\微生物建造研究进展.pdf",
+      "目录里还有一份 Ch1_ 打头的，模糊匹配会挑中它 —— 那是另一篇");
+    assert.strictEqual(plan.LNK_BRK3, RELOC_ROOT + "\\MICP 综述.PDF",
+      "Windows 上磁盘不区分大小写，.PDF 和 .pdf 是同一份");
+    assert.strictEqual(ITEMS.LNK_BRK2.attachmentPath, "E:\\Papers\\微生物建造研究进展.pdf",
+      "预演不许改路径");
+  });
+  await t("★ relocate 真写：改的是 attachmentPath，改完再体检那条就不再是断链", async () => {
+    const r = await ST({ op: "relocate", dir: RELOC_ROOT, dryRun: false, confirm: true });
+    const b = JSON.parse(r[2]);
+    assert.strictEqual(b.relocated, 2);
+    assert.deepStrictEqual(b.failed, 0);
+    assert.strictEqual(ITEMS.LNK_BRK2.attachmentPath, RELOC_ROOT + "\\微生物建造研究进展.pdf");
+    assert.strictEqual(ITEMS.LNK_BRK3.attachmentPath, RELOC_ROOT + "\\MICP 综述.PDF");
+    assert.ok(saveTxCalls.includes("LNK_BRK2"), "改了路径要落盘，不然重启就回去了");
+    const after = JSON.parse((await epCall("/zoterojs/doctor", { headers: H,
+      searchParams: new URLSearchParams("checks=linkedFiles") }))[2]).checks.linkedFiles;
+    assert.strictEqual(after.brokenCount, 1, "修好两条，应该从 3 掉到 1");
+    // 收尾：还回原样，别把后面的测试带偏
+    ITEMS.LNK_BRK2.attachmentPath = "E:\\Papers\\微生物建造研究进展.pdf";
+    ITEMS.LNK_BRK3.attachmentPath = "E:\\Papers\\MICP 综述.pdf";
+  });
+  await t("relocate 少了 confirm 一样拒（和 quarantine / restore 同一道闸）", async () => {
+    const r = await ST({ op: "relocate", dir: RELOC_ROOT, dryRun: false });
+    assert.strictEqual(r[0], 400);
+    assert.strictEqual(JSON.parse(r[2]).ok, false);
+  });
+  await t("relocate 的 dir 读不了 → 报错说清是哪个目录，不是空手而归", async () => {
+    const r = await ST({ op: "relocate", dir: "Z:\\根本不存在" });
+    assert.strictEqual(r[0], 400);
+    assert.ok(JSON.parse(r[2]).error.includes("Z:\\根本不存在"), JSON.parse(r[2]).error);
+  });
+  await t("★ storage 的 relocate 只管外链，不碰 storage 那一路", async () => {
+    /* 这一项很容易被顺手写成「扫 storage 里缺文件的附件」—— 那是另一回事：
+     * storage 附件缺文件是导入损坏，修法是重新导入，不是改路径。
+     * 这里钉住它只问 LINKED_FILE（linkMode 2）。 */
+    const r = await ST({ op: "relocate", dir: RELOC_ROOT });
+    const b = JSON.parse(r[2]);
+    assert.ok(!b.plan.some(x => x.key === "ATT_DEF1" || x.key === "ATT_OK1"),
+      "storage 附件不该出现在外链重定位的计划里");
+  });
+  await t("只读模式下 storage 回 403（GET 也算写，理由和 enrich 一样）", () =>
+    withPref("jsbridge.readonly", true, async () => {
+      assert.strictEqual((await epCall("/zoterojs/storage", { headers: H,
+        searchParams: new URLSearchParams("op=list") }))[0], 403,
+        "list 也是 GET —— 闸门是按端点开的，不是按 op 开的");
+    }));
+  await t("端点在面板开关里能关掉，ping 会把它列进 disabled", () =>
+    withPref("jsbridge.endpoint.storage", false, async () => {
+      assert.strictEqual((await ST({ op: "list" }))[0], 404);
+      const ping = await epCall("/zoterojs/ping", { method: "GET", headers: {} });
+      assert.ok(JSON.parse(ping[2]).disabled.includes("/zoterojs/storage"));
+    }));
 
   console.log("\n[8.8] 备份");
   await t("立即备份：建目录、写文件、报出大小", async () => {

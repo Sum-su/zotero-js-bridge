@@ -2,7 +2,7 @@
 
 The `merge` endpoint merges duplicate Zotero items into a surviving `master` item, and only after eight self-checks confirm that each duplicate is the same work.
 
-The endpoint is `POST /zoterojs/merge`, takes a JSON body of `{"master": "<KEY>", "dups": ["<KEY>", ...], "dryRun": false}` (`bootstrap.js:1878-1890`), and requires the `X-ZoteroJS-Token` header. It counts as a write endpoint even for a dry run, so read-only mode rejects it with `403` (`bootstrap.js:1882`, `bootstrap.js:208-231`). Parameters and error codes are listed in [the endpoint reference](endpoints.md#the-merge-endpoint). This file describes plugin version 1.12.
+The endpoint is `POST /zoterojs/merge`, takes a JSON body of `{"master": "<KEY>", "dups": ["<KEY>", ...], "dryRun": false}` (`bootstrap.js:1878-1890`), and requires the `X-ZoteroJS-Token` header. It counts as a write endpoint even for a dry run, so read-only mode rejects it with `403` (`bootstrap.js:1882`, `bootstrap.js:208-231`). Parameters and error codes are listed in [the endpoint reference](endpoints.md#the-merge-endpoint). This file describes plugin version 1.13.
 
 ## The core rule: missing is not a conflict
 

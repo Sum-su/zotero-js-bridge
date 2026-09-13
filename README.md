@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-A Zotero plugin that exposes eight local HTTP endpoints for running JavaScript inside a live Zotero process, so scripts can merge items, query the library, edit metadata, and take backups without a human pasting code into **Tools → Developer → Run JavaScript**.
+A Zotero plugin that exposes nine local HTTP endpoints for running JavaScript inside a live Zotero process, so scripts can merge items, query the library, edit metadata, take backups, and reclaim disk space from orphaned attachment directories without a human pasting code into **Tools → Developer → Run JavaScript**.
 
 [![release](https://img.shields.io/github/v/release/Sum-su/zotero-js-bridge?label=release)](../../releases/latest)
 [![CI](https://github.com/Sum-su/zotero-js-bridge/actions/workflows/test.yml/badge.svg)](../../actions/workflows/test.yml)
@@ -11,7 +11,7 @@ A Zotero plugin that exposes eight local HTTP endpoints for running JavaScript i
 
 ## Why this exists
 
-Zotero's plugin API has no out-of-process channel. Anything the connector API does not cover — merging duplicate items, moving attachments, bulk-editing fields, calling internal modules — can only be done from inside the Zotero process. The plugin attaches to the HTTP server Zotero already runs on `127.0.0.1:23119` and registers eight JSON endpoints there. It does not open a new port and does not hold a socket, so Zotero still exits cleanly.
+Zotero's plugin API has no out-of-process channel. Anything the connector API does not cover — merging duplicate items, moving attachments, bulk-editing fields, calling internal modules — can only be done from inside the Zotero process. The plugin attaches to the HTTP server Zotero already runs on `127.0.0.1:23119` and registers nine JSON endpoints there. It does not open a new port and does not hold a socket, so Zotero still exits cleanly.
 
 > [!WARNING]
 > These endpoints execute **arbitrary JavaScript inside Zotero**, with full access to your library. Any process that can read the token file can delete your entire library. This is a personal automation tool, not a hardened service. Read the [security model](#security-model) before installing.
@@ -21,7 +21,7 @@ Zotero's plugin API has no out-of-process channel. Anything the connector API do
 | | |
 | --- | --- |
 | Zotero | 7 through 10 (`strict_min_version` `6.999`, `strict_max_version` `10.99.99`); developed and verified on **Zotero 10.0.2** |
-| Python | 3.8+ for the bundled client; any HTTP client works, the protocol is eight JSON endpoints |
+| Python | 3.8+ for the bundled client; any HTTP client works, the protocol is nine JSON endpoints |
 
 ## Install
 
@@ -82,10 +82,11 @@ Full CLI flags and Python signatures: [`docs/endpoints.md`](docs/endpoints.md).
 | `/zoterojs/doctor` | GET, POST | | Read-only library health checks; does not touch the network by default. |
 | `/zoterojs/apply` | POST | ✅ | Bulk metadata writes, dry-run by default, with collection-membership diffing. |
 | `/zoterojs/enrich` | GET, POST | ✅ | Fill empty fields from what a vision model read off a scanned PDF. Fill-only, never overwrite. |
+| `/zoterojs/storage` | GET, POST | ✅ | Quarantine orphan `storage/` directories and re-point broken linked-file attachments. **The only endpoint that touches the filesystem**, so a real write needs `dryRun:false` and `confirm:true`. |
 
 `backup` is not an endpoint. It is a button in the preference pane plus an automatic-before-write switch.
 
-Every write is additionally guarded: read-only mode returns `403` for `exec`, `merge`, `apply`, and `enrich`, including their dry-run forms. Detailed parameters, response shapes, and error codes are in [`docs/endpoints.md`](docs/endpoints.md).
+Every write is additionally guarded: read-only mode returns `403` for `exec`, `merge`, `apply`, `enrich`, and `storage`, including their dry-run forms. Detailed parameters, response shapes, and error codes are in [`docs/endpoints.md`](docs/endpoints.md).
 
 Requests whose `User-Agent` starts with `Mozilla/`, or that carry an `Origin` header, are dropped by **Zotero's own CSRF guard** before they reach the plugin. Command-line clients are unaffected; browser-side callers must send `x-zotero-connector-api-version`, as with any Zotero plugin endpoint.
 
@@ -93,6 +94,7 @@ In-depth references:
 
 - [`docs/merge.md`](docs/merge.md) — the eight self-checks, value normalization, the ISBN backstop.
 - [`docs/enrich.md`](docs/enrich.md) — the two modes, the fill-only rule, the three gates and the real errors they were built from.
+- [`docs/storage.md`](docs/storage.md) — orphan-directory quarantine and linked-file relocation: why it is reversible, why the match is exact, and why the two write gates are not one.
 
 ## Settings
 
@@ -100,9 +102,9 @@ In-depth references:
 
 | Pref (`extensions.zotero.jsbridge.…`) | Default | Effect |
 | --- | --- | --- |
-| `enabled` | `true` | `false` → all eight endpoints return `503` |
-| `readonly` | `false` | `true` → `exec` / `merge` / `apply` / `enrich` return `403`; reads still work |
-| `endpoint.ping` … `endpoint.enrich` | `true` | `false` → that path returns `404` |
+| `enabled` | `true` | `false` → all nine endpoints return `503` |
+| `readonly` | `false` | `true` → `exec` / `merge` / `apply` / `enrich` / `storage` return `403`; reads still work |
+| `endpoint.ping` … `endpoint.storage` | `true` | `false` → that path returns `404` |
 | `enrich.minChars` | `1000` | Extracted character count below which a PDF counts as having no text layer |
 | `limit.responseKB` | `1500` | Response size cap, clamped to 10–20000 |
 | `backup.enabled` | `false` | `true` → back up before every `merge` / `apply` / `enrich` write |
@@ -160,7 +162,7 @@ Contributor documentation — harness design, the mutation philosophy, stub fide
 
 | File | Contents |
 | --- | --- |
-| [`docs/endpoints.md`](docs/endpoints.md) | Complete reference for all eight endpoints: parameters, responses, error codes |
+| [`docs/endpoints.md`](docs/endpoints.md) | Complete reference for all nine endpoints: parameters, responses, error codes |
 | [`docs/merge.md`](docs/merge.md) | The merge self-checks, normalization, the ISBN backstop |
 | [`docs/enrich.md`](docs/enrich.md) | Scanned-PDF metadata enrichment: modes, gates, measurements |
 | [`docs/zotero-internals.md`](docs/zotero-internals.md) | Zotero and Firefox platform traps, measured rather than inferred |
