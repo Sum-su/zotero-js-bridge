@@ -154,6 +154,6 @@ Two conditions abort the whole request before any item is touched: `master` miss
 
 ## See also
 
-- [`endpoints.md`](endpoints.md) — parameters, response fields, and error codes for the `merge` endpoint and the other seven endpoints.
+- [`endpoints.md`](endpoints.md) — parameters, response fields, and error codes for the `merge` endpoint and the other eight endpoints.
 - [`enrich.md`](enrich.md) — the fill-only metadata enrichment endpoint and the gates that guard it.
 - [`../README.md`](../README.md) — installation, settings, and the endpoint table.

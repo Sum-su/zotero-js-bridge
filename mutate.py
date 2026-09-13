@@ -95,7 +95,11 @@ MUTANTS = [
      "        for (const cid of (this.collections || [])) {",
      "        for (const cid of ([])) {",
      "test_bridge.js"),
-    # --- storage 端点 / 三个新体检项 ---
+    # --- storage 端点 / v1.13 新增与重写的体检项 ---
+    # 这九条里：六条打在 storage 端点（含它用的 walkFiles），两条打在 tagVariants，
+    # 一条打在 apply --tags 的 autoBecomeManual。**orphanStorage 自己的逻辑没有变异体**
+    # ——它的内容/缓存拆分和 deep 目前只被功能测试盖着，没被"改坏了必须变红"盖着。
+    # 写注释时别再把它算成"新体检项"：v1.12 就有它了，v1.13 是重写。
     ("★ 遍历文件时把 stat 的 type 字面量写错（2026-09-13 真机上就是这么拿到一个自信的 0）",
      "      if (st.type === \"directory\") { stack.push(p); continue; }\n",
      "      if (st.type === \"directory\") { stack.push(p); continue; }\n"
