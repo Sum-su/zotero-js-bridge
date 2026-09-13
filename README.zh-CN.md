@@ -164,6 +164,7 @@ python check_backup.py [DIR]     # 只读打开每份备份，验完整性
 | [`docs/merge.md`](docs/merge.md) | 合并自检、归一化、ISBN 硬防线 |
 | [`docs/enrich.md`](docs/enrich.md) | 扫描件补全：两种模式、三道闸、实测数据 |
 | [`docs/zotero-internals.md`](docs/zotero-internals.md) | Zotero / Firefox 平台陷阱，全部实测而非推测 |
+| [`docs/plugin-interop.md`](docs/plugin-interop.md) | 从 `exec` 里调用其它已装插件：哪些真能调、哪些只是看着能调、以及中间那几道坑 |
 | [`docs/development.md`](docs/development.md) | 测试脚手架、变异验证、打包、CI、版本约定 |
 | [`llms.txt`](llms.txt) | 给语言模型用的机器可读索引；全文单文件版在 [`llms-full.txt`](llms-full.txt) |
 | [README.md](README.md) | English |

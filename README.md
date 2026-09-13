@@ -164,6 +164,7 @@ Contributor documentation — harness design, the mutation philosophy, stub fide
 | [`docs/merge.md`](docs/merge.md) | The merge self-checks, normalization, the ISBN backstop |
 | [`docs/enrich.md`](docs/enrich.md) | Scanned-PDF metadata enrichment: modes, gates, measurements |
 | [`docs/zotero-internals.md`](docs/zotero-internals.md) | Zotero and Firefox platform traps, measured rather than inferred |
+| [`docs/plugin-interop.md`](docs/plugin-interop.md) | Reaching other installed plugins from `exec`: what is callable, what only looks callable, and the traps in between |
 | [`docs/development.md`](docs/development.md) | Test harness, mutation testing, packaging, CI, versioning |
 | [`llms.txt`](llms.txt) | Machine-readable index for language models, with a single-file corpus at [`llms-full.txt`](llms-full.txt) |
 | [README.zh-CN.md](README.zh-CN.md) | 中文说明 |

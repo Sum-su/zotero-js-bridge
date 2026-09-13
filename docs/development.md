@@ -86,6 +86,8 @@ Two assertions do not test the plugin at all. They test whether the harness is s
 
 XML comments in the pane are stripped before this check, so a commented-out `preference="…"` is treated as prose, not as a binding.
 
+**The xpi hash is not a stable identifier for a source revision.** Two builds of the same checkout produce the same hash, but a build of the same *content* from a different checkout does not: the archive stores each entry's mtime, so the hash tracks file timestamps as well as bytes. Before concluding that a published asset was tampered with, unzip both and compare the entries — measured on the v1.12 asset, the archive hashes differed while all six extracted files were byte-identical.
+
 `build.py --bump` increments the manifest version before packaging. `build.py --install` packages, then asks the running bridge to install the xpi through `AddonManager`, and polls `ping` (up to 20 attempts, 0.25 s apart) to report which version is live; `install()` resolves before the new instance has started, so an immediate `ping` can return `404 No endpoint found`.
 
 ## Continuous integration

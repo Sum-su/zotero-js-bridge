@@ -16,6 +16,11 @@ Plugin authors are the intended audience, with the maintainers of this project a
 | `Zotero.Items.get` | sync — `(ids)` |
 | `Zotero.Items.getByLibraryAndKey` | sync — `(libraryID, key, options)` |
 
+The async conversion is **not limited to the item data APIs**. `Zotero.Plugins.getRootURI` also
+returns a Promise in Zotero 10, so the usual "get a URI, hand it to `Services.io.newURI`" sequence
+fails with `NS_ERROR_MALFORMED_URI` — `String()` on the un-awaited value gives `"[object Promise]"`,
+which is a string, so nothing complains until the URI is parsed.
+
 The serializer in this plugin flags un-awaited promises explicitly instead of returning a silent `{}`:
 
 ```text
