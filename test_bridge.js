@@ -1878,7 +1878,10 @@ const t = async (name, fn) => {
     assert.strictEqual(d.unmatchedMB, 89.5);
     assert.ok(d.note.includes("不构成证据"), "报出来的是线索，得说明白");
   });
-  await t("orphanStorage 不给 deep 就不遍历在用的那批（全量遍历实测会超时）", async () => {
+  // 标题里原先写的是「全量遍历实测会超时」—— 那是错的，2026-09-13 实测全量稳定在
+  // 约 2 秒（2023/2013/2054 ms），而且 deep 走的就是全量，等于说一个常态动作会超时。
+  // 真正的理由：活目录不可能出现在孤儿清单里，多走九倍 I/O 换不来任何东西。
+  await t("orphanStorage 不给 deep 就不遍历在用的那批（活目录进不了这份输出，走它没用）", async () => {
     setupStorage(DEFAULT_STORAGE);
     const r = await epCall("/zoterojs/doctor", { headers: H,
       searchParams: new URLSearchParams("checks=orphanStorage") });
